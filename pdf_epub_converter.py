@@ -9,6 +9,17 @@ pdf_epub_converter.py
 
 ⚠️ متطلب أساسي: يجب تثبيت Calibre على النظام (توفر أمر `ebook-convert`).
 لن يعمل هذا الملف بدون تثبيته أولًا.
+
+طريقة تثبيت Calibre على Docker (Debian/Ubuntu) - الطريقة الموصى بها للأنظمة
+الخادمية بدون واجهة رسومية (headless)، لأن نسخة apt غالبًا قديمة أو ناقصة:
+
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+            libgl1 libxkbcommon0 libegl1 wget xz-utils \
+        && rm -rf /var/lib/apt/lists/* \
+        && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sh /dev/stdin
+
+بعد التثبيت سيتوفر الأمر `ebook-convert` على المسار /opt/calibre/ebook-convert
+(السكربت أعلاه يضيفه تلقائيًا إلى /usr/bin).
 """
 
 import asyncio
@@ -55,16 +66,30 @@ class EbookConversionError(Exception):
 
 def is_calibre_available() -> bool:
     """يتحقق مما إذا كان أمر ebook-convert متاحًا على النظام."""
-    return shutil.which(EBOOK_CONVERT_BIN) is not None or Path(EBOOK_CONVERT_BIN).is_file()
+    return shutil.which(EBOOK_CONVERT_BIN) is not None
 
 
 async def _run_ebook_convert(input_path: Path, output_path: Path, *extra_args: str) -> None:
-    """تشغيل ebook-convert بشكل غير متزامن مع مهلة زمنية قصوى."""
+    """تشغيل ebook-convert بشكل غير متزامن مع مهلة زمنية قصوى.
+
+    نضبط متغيرات بيئة خاصة بـ Qt/Chromium لأن محرك عرض EPUB➜PDF في Calibre
+    يعتمد على QtWebEngine (متصفح Chromium مدمج)، وهذا يفشل افتراضيًا داخل
+    حاويات Docker التي تعمل بصلاحيات root وبدون بطاقة رسوميات (GPU).
+    """
     if not is_calibre_available():
         raise EbookConversionError(
             "أداة ebook-convert غير مثبتة على هذا النظام. "
             "يجب تثبيت Calibre أولًا (راجع تعليمات الملف)."
         )
+
+    import os as _os
+    env = dict(_os.environ)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    env.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+    env.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        "--no-sandbox --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage",
+    )
 
     cmd = [EBOOK_CONVERT_BIN, str(input_path), str(output_path), *extra_args]
 
@@ -72,6 +97,7 @@ async def _run_ebook_convert(input_path: Path, output_path: Path, *extra_args: s
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
 
     try:
@@ -89,7 +115,7 @@ async def _run_ebook_convert(input_path: Path, output_path: Path, *extra_args: s
 
 
 # ----------------------------------------------------------------------
-# الدوال العامة (يتم استيرادها داخل bot.py)
+# الدوال العامة (هذه ما سيتم استيراده داخل bot.py لاحقًا)
 # ----------------------------------------------------------------------
 
 async def convert_pdf_to_epub(input_path: Path, out_dir: Path) -> Path:
@@ -131,3 +157,49 @@ async def convert_epub_to_pdf(input_path: Path, out_dir: Path) -> Path:
         "--pdf-page-margin-bottom", "36",
     )
     return output_path
+
+
+# ----------------------------------------------------------------------
+# اختبار سريع من سطر الأوامر (بمعزل عن البوت)
+# الاستخدام:
+#   python pdf_epub_converter.py to_epub input.pdf ./output
+#   python pdf_epub_converter.py to_pdf input.epub ./output
+# ----------------------------------------------------------------------
+
+async def _cli_main():
+    import sys
+
+    if len(sys.argv) != 4:
+        print("الاستخدام:")
+        print("  python pdf_epub_converter.py to_epub input.pdf output_dir")
+        print("  python pdf_epub_converter.py to_pdf input.epub output_dir")
+        sys.exit(1)
+
+    mode, input_file, output_dir = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+
+    if not input_file.exists():
+        print(f"❌ الملف غير موجود: {input_file}")
+        sys.exit(1)
+
+    if not is_calibre_available():
+        print("❌ Calibre (ebook-convert) غير مثبت على هذا النظام.")
+        sys.exit(1)
+
+    try:
+        if mode == "to_epub":
+            result = await convert_pdf_to_epub(input_file, output_dir)
+        elif mode == "to_pdf":
+            result = await convert_epub_to_pdf(input_file, output_dir)
+        else:
+            print("❌ الوضع غير معروف. استخدم to_epub أو to_pdf.")
+            sys.exit(1)
+
+        print(f"✅ تم التحويل بنجاح: {result}")
+    except EbookConversionError as e:
+        print(f"❌ فشل التحويل: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(_cli_main())
