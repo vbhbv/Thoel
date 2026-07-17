@@ -13,6 +13,7 @@ import asyncio
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -618,7 +619,20 @@ def main():
             "⚠️ Calibre (ebook-convert) غير مثبت. ميزة EPUB ➜ PDF لن تعمل حتى يتم تثبيته."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # تكوين مخصص لطلب الشبكة لتوسيع مهلة الاتصال ومنع الـ ConnectTimeout و الـ TimedOut على Railway
+    request_config = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=60.0,
+        write_timeout=30.0,
+        pool_size=8
+    )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request_config)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -631,7 +645,13 @@ def main():
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
     logger.info("🚀 البوت يعمل الآن بكفاءة وبأمان كامل للذاكرة...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # تشغيل مستمع التحديثات مع تخطي التحديثات المعلقة القديمة منعاً للضغط وقت بدء التشغيل
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False
+    )
 
 
 if __name__ == "__main__":
