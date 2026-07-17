@@ -1,9 +1,8 @@
 """
 بوت تليجرام لتحويل الصيغ
 - Word <-> PDF
-- PDF <-> EPUB
 - تحويل الصوت لعدة صيغ
-- تحويل الصور إلى PDF أو Word
+- تحويل الصور (المجمعة والمفردة) إلى PDF أو Word
 مصمم للنشر على Railway
 """
 
@@ -24,7 +23,6 @@ from telegram.ext import (
 )
 
 from pdf_epub_converter import (
-    convert_pdf_to_epub,
     convert_epub_to_pdf,
     is_calibre_available,
     EbookConversionError,
@@ -138,65 +136,72 @@ async def convert_audio(input_path: Path, out_dir: Path, target_format: str) -> 
     return output_path
 
 
-async def convert_image_to_pdf(input_path: Path, out_dir: Path) -> Path:
-    """تحويل صورة إلى PDF باستخدام Pillow و img2pdf."""
-    output_path = out_dir / (input_path.stem + ".pdf")
+async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_name: str) -> Path:
+    """تحويل قائمة صور مجمعة إلى ملف PDF واحد."""
+    output_path = out_dir / (base_name + ".pdf")
 
     def _convert():
         from PIL import Image
         import img2pdf
 
-        img = Image.open(input_path)
-        if img.mode in ("RGBA", "P", "LA"):
-            img = img.convert("RGB")
+        processed_paths = []
+        for path in input_paths:
+            img = Image.open(path)
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            tmp_path = path.with_suffix(".conv.jpg")
+            img.save(tmp_path, "JPEG", quality=95)
+            processed_paths.append(str(tmp_path))
 
-        tmp_path = input_path.with_suffix(".conv.jpg")
-        img.save(tmp_path, "JPEG", quality=95)
-
-        pdf_bytes = img2pdf.convert(str(tmp_path))
+        pdf_bytes = img2pdf.convert(processed_paths)
         with open(output_path, "wb") as f:
             f.write(pdf_bytes)
 
-        tmp_path.unlink(missing_ok=True)
+        for p in processed_paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _convert)
 
     if not output_path.exists():
-        raise RuntimeError("فشل تحويل الصورة إلى PDF")
+        raise RuntimeError("فشل تحويل الصور إلى PDF")
     return output_path
 
 
-async def convert_image_to_docx(input_path: Path, out_dir: Path) -> Path:
-    """تحويل صورة إلى ملف Word (تُدرج الصورة داخل مستند)."""
-    output_path = out_dir / (input_path.stem + ".docx")
+async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_name: str) -> Path:
+    """تحويل مجموعة صور مجمعة إلى ملف Word واحد (تُدرج الصور بالتوالي)."""
+    output_path = out_dir / (base_name + ".docx")
 
     def _convert():
         from docx import Document
         from docx.shared import Inches
         from PIL import Image
 
-        img = Image.open(input_path)
-        if img.mode in ("RGBA", "P", "LA"):
-            img = img.convert("RGB")
-            fixed_path = input_path.with_suffix(".conv.jpg")
-            img.save(fixed_path, "JPEG", quality=95)
-            source = fixed_path
-        else:
-            source = input_path
-
         doc = Document()
-        doc.add_picture(str(source), width=Inches(6))
-        doc.save(str(output_path))
+        for path in input_paths:
+            img = Image.open(path)
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+                fixed_path = path.with_suffix(".conv.jpg")
+                img.save(fixed_path, "JPEG", quality=95)
+                source = fixed_path
+            else:
+                source = path
 
-        if source != input_path:
-            source.unlink(missing_ok=True)
+            doc.add_picture(str(source), width=Inches(6))
+            if source != path:
+                source.unlink(missing_ok=True)
+
+        doc.save(str(output_path))
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _convert)
 
     if not output_path.exists():
-        raise RuntimeError("فشل تحويل الصورة إلى Word")
+        raise RuntimeError("فشل تحويل الصور إلى Word")
     return output_path
 
 
@@ -208,9 +213,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
-        [InlineKeyboardButton("📚 PDF ⇄ EPUB", callback_data="mode_ebook")],
+        [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
-        [InlineKeyboardButton("🖼️ تحويل صورة إلى PDF/Word", callback_data="mode_image")],
+        [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
         [InlineKeyboardButton("ℹ️ مساعدة", callback_data="mode_help")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -232,19 +237,18 @@ def audio_format_keyboard() -> InlineKeyboardMarkup:
 def image_format_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [
-            InlineKeyboardButton("📄 PDF", callback_data="imgfmt_pdf"),
-            InlineKeyboardButton("📝 Word", callback_data="imgfmt_docx"),
+            InlineKeyboardButton("📄 PDF واحد", callback_data="imgfmt_pdf"),
+            InlineKeyboardButton("📝 Word واحد", callback_data="imgfmt_docx"),
         ]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
 def pdf_target_keyboard() -> InlineKeyboardMarkup:
-    """عند استقبال PDF: نسأل المستخدم إن كان يريده كـ Word أو EPUB."""
+    """عند استقبال PDF: خيار التحويل إلى Word فقط."""
     buttons = [
         [
             InlineKeyboardButton("📝 Word", callback_data="pdftarget_word"),
-            InlineKeyboardButton("📚 EPUB", callback_data="pdftarget_epub"),
         ]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -259,10 +263,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 أهلًا بك في بوت تحويل الصيغ!\n\n"
         "🔹 أرسل ملف Word وسيتحول تلقائيًا إلى PDF.\n"
-        "🔹 أرسل ملف PDF وسأسألك: Word أم EPUB؟\n"
+        "🔹 أرسل ملف PDF وستحوله إلى Word.\n"
         "🔹 أرسل ملف EPUB وسيتحول تلقائيًا إلى PDF.\n"
         "🔹 أرسل ملف أو مقطع صوتي وسأعرض عليك أزرار الصيغ المتاحة.\n"
-        "🔹 أرسل صورة وسأعرض عليك تحويلها إلى PDF أو Word.\n"
+        "🔹 أرسل صورة أو مجموعة صور (مجمعة) وسأحولها لك إلى ملف PDF أو Word واحد.\n"
         "🔹 أو اختر من القائمة بالأسفل.\n\n"
         f"⚠️ الحد الأقصى لحجم الملف: {MAX_FILE_SIZE_MB} ميغابايت."
     )
@@ -273,10 +277,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📌 طريقة الاستخدام:\n"
         "1. أرسل ملف Word (.doc/.docx) لتحويله إلى PDF تلقائيًا.\n"
-        "2. أرسل ملف PDF ثم اختر تحويله إلى Word أو EPUB.\n"
+        "2. أرسل ملف PDF ثم اختر تحويله إلى Word.\n"
         "3. أرسل ملف EPUB لتحويله إلى PDF تلقائيًا.\n"
         "4. أرسل ملف/مقطع صوتي، ثم اختر الصيغة المطلوبة من الأزرار.\n"
-        "5. أرسل صورة، ثم اختر تحويلها إلى PDF أو Word.\n\n"
+        "5. أرسل صورة أو عدة صور معاً، ثم اختر تحويلها إلى PDF أو Word مجمع.\n\n"
         "الأوامر:\n"
         "/start - القائمة الرئيسية\n"
         "/help - المساعدة"
@@ -296,24 +300,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📄 أرسل الآن ملف PDF لتحويله إلى Word.")
     elif data == "mode_ebook":
         context.user_data["mode"] = "ebook"
-        await query.edit_message_text(
-            "📚 أرسل الآن ملف PDF (سأسألك عن الصيغة الهدف) أو ملف EPUB (يتحول تلقائيًا إلى PDF)."
-        )
+        await query.edit_message_text("📚 أرسل الآن ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
     elif data == "mode_audio":
         context.user_data["mode"] = "audio"
         await query.edit_message_text("🎵 أرسل الآن الملف أو المقطع الصوتي المراد تحويله.")
     elif data == "mode_image":
         context.user_data["mode"] = "image"
         await query.edit_message_text(
-            "🖼️ أرسل الآن الصورة المراد تحويلها (يفضّل إرسالها كملف/Document للحفاظ على الجودة الأصلية)."
+            "🖼️ أرسل الآن الصورة أو مجموعة الصور المراد تجميعها وتحويلها (يمكنك إرسالها كصور عادية أو كملفات)."
         )
     elif data == "mode_help":
         await query.edit_message_text(
             "أرسل ملف Word وسيتحول تلقائيًا إلى PDF.\n"
-            "أرسل ملف PDF وسأسألك: Word أم EPUB؟\n"
+            "أرسل ملف PDF وستحوله إلى Word.\n"
             "أرسل ملف EPUB ويتحول تلقائيًا إلى PDF.\n"
             "أرسل ملفًا صوتيًا وستظهر لك أزرار لاختيار الصيغة الهدف.\n"
-            "أرسل صورة وستظهر لك أزرار لتحويلها إلى PDF أو Word."
+            "أرسل صورة أو عدة صور مجمعة لتجميعها داخل ملف PDF أو Word واحد."
         )
     elif data.startswith("audiofmt_"):
         target_format = data.split("_", 1)[1]
@@ -346,13 +348,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # كشف تلقائي إن كانت صورة تُرسل كمستند (لتفادي ضغط تليجرام للصور)
     if ext in IMAGE_EXTENSIONS:
-        await prompt_image_format(update, context, document, filename)
+        await queue_image_processing(update, context, document.file_id, document.file_unique_id, filename)
         return
 
     if ext in DOC_EXTENSIONS:
         await process_word_to_pdf(update, context, document, filename)
     elif ext == PDF_EXTENSION:
-        # PDF قد يُراد تحويله إلى Word أو EPUB، لذا نسأل المستخدم
         await prompt_pdf_target(update, context, document, filename)
     elif ext == EPUB_EXTENSION:
         await process_epub_to_pdf(update, context, document, filename)
@@ -372,7 +373,53 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """استقبال صورة مرسلة كـ Photo (مضغوطة من تليجرام)."""
     photo = update.message.photo[-1]  # أعلى دقة متاحة
     filename = f"{photo.file_unique_id}.jpg"
-    await prompt_image_format(update, context, photo, filename)
+    await queue_image_processing(update, context, photo.file_id, photo.file_unique_id, filename)
+
+
+# ---------- مؤقت تجميع الصور ----------
+
+async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, file_unique_id: str, filename: str):
+    """تقوم بتجميع الصور القادمة في نفس الوقت وتأخير معالجتها حتى تكتمل المجموعة."""
+    chat_id = update.message.chat_id
+    
+    if "image_album" not in context.chat_data:
+        context.chat_data["image_album"] = []
+        
+    context.chat_data["image_album"].append({
+        "file_id": file_id,
+        "file_unique_id": file_unique_id,
+        "filename": filename
+    })
+    
+    # إلغاء المؤقت القديم وجدولة مؤقت جديد (ينتظر ثانيتين للاستقرار بعد آخر صورة وصلت)
+    job_name = f"img_job_{chat_id}"
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+        
+    context.job_queue.run_once(
+        trigger_image_prompt,
+        when=2.0,
+        chat_id=chat_id,
+        name=job_name,
+        data={"message_id": update.message.message_id}
+    )
+
+
+async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
+    """عرض زر اختيار نوع التحويل لكافة الصور بعد انتهاء مهلة التجميع."""
+    job = context.job_queue.get_jobs_by_name(f"img_job_{context.job.chat_id}")[0]
+    album_size = len(context.chat_data.get("image_album", []))
+    
+    if album_size == 0:
+        return
+        
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text=f"🖼️ تم استقبال {album_size} من الصور. اختر الصيغة المجمعة التي تريد التحويل إليها:",
+        reply_to_message_id=context.job.data["message_id"],
+        reply_markup=image_format_keyboard()
+    )
 
 
 # ---------- Word -> PDF ----------
@@ -394,7 +441,7 @@ async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
 
 
-# ---------- PDF -> (Word / EPUB) ----------
+# ---------- PDF -> Word ----------
 
 async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -407,7 +454,7 @@ async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "filename": filename,
     }
     await update.message.reply_text(
-        "📄 اختر الصيغة التي تريد تحويل PDF إليها:",
+        "📄 اضغط على الزر لتأكيد تحويل ملف PDF إلى Word:",
         reply_markup=pdf_target_keyboard(),
     )
 
@@ -419,33 +466,22 @@ async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("⚠️ لم يتم العثور على ملف PDF. أرسل الملف من جديد.")
         return
 
-    label = "Word" if target_format == "word" else "EPUB"
-    await query.edit_message_text(f"⏳ جاري التحويل إلى {label}...")
+    await query.edit_message_text("⏳ جاري التحويل إلى Word...")
     try:
         local_path = await download_telegram_file(
             context, pending["file_id"], pending["file_unique_id"], pending["filename"]
         )
 
-        if target_format == "word":
-            result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
-        else:
-            if not is_calibre_available():
-                raise EbookConversionError(
-                    "خاصية EPUB غير مفعّلة على هذا الخادم (Calibre غير مثبت)."
-                )
-            result_path = await convert_pdf_to_epub(local_path, CONVERTED_DIR)
+        result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
 
         with open(result_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=query.message.chat_id,
                 document=f,
                 filename=result_path.name,
-                caption=f"✅ تم التحويل إلى {label} بنجاح.",
+                caption="✅ تم التحويل إلى Word بنجاح.",
             )
         await query.delete_message()
-    except EbookConversionError as e:
-        logger.exception("pdf2epub error")
-        await query.edit_message_text(f"❌ {e}")
     except Exception as e:
         logger.exception("pdf target conversion error")
         await query.edit_message_text(f"❌ حدث خطأ أثناء التحويل: {e}")
@@ -527,54 +563,43 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
 
 # ---------- الصور ----------
 
-async def prompt_image_format(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
-    if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-        await update.message.reply_text(f"⚠️ الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} ميغابايت).")
-        return
-
-    context.user_data["pending_image"] = {
-        "file_id": tg_file.file_id,
-        "file_unique_id": tg_file.file_unique_id,
-        "filename": filename,
-    }
-    await update.message.reply_text(
-        "🖼️ اختر الصيغة التي تريد تحويل الصورة إليها:",
-        reply_markup=image_format_keyboard(),
-    )
-
-
 async def handle_image_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
     query = update.callback_query
-    pending = context.user_data.get("pending_image")
-    if not pending:
-        await query.edit_message_text("⚠️ لم يتم العثور على صورة. أرسل الصورة من جديد.")
+    album = context.chat_data.get("image_album")
+    
+    if not album:
+        await query.edit_message_text("⚠️ لم يتم العثور على صور مجمعة. أرسل الصور من جديد.")
         return
 
     label = "PDF" if target_format == "pdf" else "Word"
-    await query.edit_message_text(f"⏳ جاري التحويل إلى {label}...")
+    await query.edit_message_text(f"⏳ جاري تحميل وتجميع {len(album)} صور وتحويلها إلى ملف {label} واحد...")
+    
     try:
-        local_path = await download_telegram_file(
-            context, pending["file_id"], pending["file_unique_id"], pending["filename"]
-        )
-
+        local_paths = []
+        for img_info in album:
+            p = await download_telegram_file(context, img_info["file_id"], img_info["file_unique_id"], img_info["filename"])
+            local_paths.append(p)
+            
+        base_name = f"images_bundle_{int(time.time())}"
+        
         if target_format == "pdf":
-            result_path = await convert_image_to_pdf(local_path, CONVERTED_DIR)
+            result_path = await convert_images_to_pdf(local_paths, CONVERTED_DIR, base_name)
         else:
-            result_path = await convert_image_to_docx(local_path, CONVERTED_DIR)
+            result_path = await convert_images_to_docx(local_paths, CONVERTED_DIR, base_name)
 
         with open(result_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=query.message.chat_id,
                 document=f,
                 filename=result_path.name,
-                caption=f"✅ تم التحويل إلى {label} بنجاح.",
+                caption=f"✅ تم تجميع وتحويل الصور إلى ملف {label} بنجاح.",
             )
         await query.delete_message()
     except Exception as e:
         logger.exception("image conversion error")
-        await query.edit_message_text(f"❌ حدث خطأ أثناء التحويل: {e}")
+        await query.edit_message_text(f"❌ حدث خطأ أثناء تحويل وتجميع الصور: {e}")
     finally:
-        context.user_data.pop("pending_image", None)
+        context.chat_data.pop("image_album", None)
 
 
 # ----------------------------------------------------------------------
@@ -603,7 +628,7 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not is_calibre_available():
         logger.warning(
-            "⚠️ Calibre (ebook-convert) غير مثبت. ميزة PDF⇄EPUB لن تعمل حتى يتم تثبيته."
+            "⚠️ Calibre (ebook-convert) غير مثبت. ميزة EPUB ➜ PDF لن تعمل حتى يتم تثبيته."
         )
 
     app = Application.builder().token(BOT_TOKEN).build()
