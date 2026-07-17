@@ -408,7 +408,7 @@ async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_T
 
 async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
     """عرض زر اختيار نوع التحويل لكافة الصور بعد انتهاء مهلة التجميع."""
-    job = context.job_queue.get_jobs_by_name(f"img_job_{context.job.chat_id}")[0]
+    job_data = context.job.data
     album_size = len(context.chat_data.get("image_album", []))
     
     if album_size == 0:
@@ -417,7 +417,7 @@ async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=context.job.chat_id,
         text=f"🖼️ تم استقبال {album_size} من الصور. اختر الصيغة المجمعة التي تريد التحويل إليها:",
-        reply_to_message_id=context.job.data["message_id"],
+        reply_to_message_id=job_data["message_id"],
         reply_markup=image_format_keyboard()
     )
 
@@ -537,7 +537,7 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     pending = context.user_data.get("pending_audio")
     if not pending:
-        await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتي. أرسل الملف من جديد.")
+        await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتی. أرسل الملف من جديد.")
         return
 
     await query.edit_message_text(f"⏳ جاري التحويل إلى {target_format.upper()}...")
@@ -631,6 +631,7 @@ def main():
             "⚠️ Calibre (ebook-convert) غير مثبت. ميزة EPUB ➜ PDF لن تعمل حتى يتم تثبيته."
         )
 
+    # بناء التطبيق مع تفعيل ودعم الـ JobQueue بشكل صريح لحل مشكلة عدم بدء المجدول تلقائياً
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -640,6 +641,7 @@ def main():
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
+    # جدولة مهام التنظيف الدوري للملفات المؤقتة
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
     logger.info("🚀 البوت يعمل الآن...")
