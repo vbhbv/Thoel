@@ -1,11 +1,11 @@
 """
 pdf_epub_converter.py
 ----------------------
-وحدة مستقلة لتحويل PDF <-> EPUB باستخدام أداة ebook-convert من Calibre.
+وحدة مستقلة لتحويل EPUB إلى PDF باستخدام أداة ebook-convert من Calibre.
 
 هذا الملف مستقل تمامًا عن bot.py حاليًا، مصمم ليسهل اختباره وبرمجته
-بمعزل، ثم ربطه لاحقًا داخل bot.py عبر استيراد الدالتين:
-    from pdf_epub_converter import convert_pdf_to_epub, convert_epub_to_pdf
+بمعزل، ثم ربطه لاحقًا داخل bot.py عبر استيراد الدالة:
+    from pdf_epub_converter import convert_epub_to_pdf
 
 ⚠️ متطلب أساسي: يجب تثبيت Calibre على النظام (توفر أمر `ebook-convert`).
 لن يعمل هذا الملف بدون تثبيته أولًا.
@@ -118,27 +118,6 @@ async def _run_ebook_convert(input_path: Path, output_path: Path, *extra_args: s
 # الدوال العامة (هذه ما سيتم استيراده داخل bot.py لاحقًا)
 # ----------------------------------------------------------------------
 
-async def convert_pdf_to_epub(input_path: Path, out_dir: Path) -> Path:
-    """
-    تحويل ملف PDF إلى EPUB.
-
-    ملاحظة جودة: تحويل PDF -> EPUB هو الأصعب تقنيًا لأن PDF ذو تخطيط ثابت
-    بينما EPUB يحتاج نصًا قابلًا لإعادة التدفق. النتيجة تكون جيدة مع الكتب
-    النصية البسيطة، وقد تكون متوسطة الجودة مع الجداول أو الأعمدة المتعددة
-    أو الخطوط المعقدة.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    output_path = out_dir / (input_path.stem + ".epub")
-
-    await _run_ebook_convert(
-        input_path,
-        output_path,
-        # خيارات تحسّن جودة استخراج النص من PDF
-        "--enable-heuristics",
-    )
-    return output_path
-
-
 async def convert_epub_to_pdf(input_path: Path, out_dir: Path) -> Path:
     """
     تحويل ملف EPUB إلى PDF.
@@ -162,7 +141,6 @@ async def convert_epub_to_pdf(input_path: Path, out_dir: Path) -> Path:
 # ----------------------------------------------------------------------
 # اختبار سريع من سطر الأوامر (بمعزل عن البوت)
 # الاستخدام:
-#   python pdf_epub_converter.py to_epub input.pdf ./output
 #   python pdf_epub_converter.py to_pdf input.epub ./output
 # ----------------------------------------------------------------------
 
@@ -171,7 +149,6 @@ async def _cli_main():
 
     if len(sys.argv) != 4:
         print("الاستخدام:")
-        print("  python pdf_epub_converter.py to_epub input.pdf output_dir")
         print("  python pdf_epub_converter.py to_pdf input.epub output_dir")
         sys.exit(1)
 
@@ -186,12 +163,10 @@ async def _cli_main():
         sys.exit(1)
 
     try:
-        if mode == "to_epub":
-            result = await convert_pdf_to_epub(input_file, output_dir)
-        elif mode == "to_pdf":
+        if mode == "to_pdf":
             result = await convert_epub_to_pdf(input_file, output_dir)
         else:
-            print("❌ الوضع غير معروف. استخدم to_epub أو to_pdf.")
+            print("❌ الوضع غير معروف. استخدم to_pdf فقط.")
             sys.exit(1)
 
         print(f"✅ تم التحويل بنجاح: {result}")
