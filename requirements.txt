@@ -3,4 +3,3 @@ pdf2docx==0.5.8
 Pillow==10.4.0
 img2pdf==0.5.1
 python-docx==1.1.2
-music-tag==0.4.3
