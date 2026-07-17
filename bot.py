@@ -90,7 +90,7 @@ async def download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: st
 def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None, album_art_path: Path = None):
     """تعديل الـ tags وحقن الغلاف بدقة لكل صيغة صوتية عبر مكتبة Mutagen."""
     ext = audio_path.suffix.lower()
-    
+
     try:
         # 1. معالجة ملفات MP3 (تستخدم ID3 و APIC للغلاف)
         if ext == ".mp3":
@@ -99,7 +99,7 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
                 audio = ID3(str(audio_path))
             except ID3NoHeaderError:
                 audio = ID3()
-            
+
             if title:
                 audio.add(TIT2(encoding=3, text=title))
             if artist:
@@ -145,7 +145,7 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
             from mutagen.oggvorbis import OggVorbis
             import base64
             from mutagen.flac import Picture
-            
+
             audio = OggVorbis(str(audio_path))
             if title:
                 audio["title"] = title
@@ -157,7 +157,6 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
                     pic.data = img_f.read()
                 pic.type = 3
                 pic.mime = "image/jpeg"
-                # تشفير البيانات بصيغة base64 وحقنها كـ metadata قياسي لـ Vorbis
                 audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
             audio.save()
 
@@ -165,7 +164,6 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
         elif ext == ".wav":
             from mutagen.wave import WAVE
             audio = WAVE(str(audio_path))
-            # ملحوظة: الـ WAV يفضل تركها كما هي أو التعامل مع الـ ID3 المضمن بحذر
             if title or artist:
                 logger.info("صيغة WAV لا تدعم الأغلفة بشكل قياسي، تم تخطي الغلاف.")
 
@@ -436,10 +434,10 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
     try:
         local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
         result_path = await convert_audio(local_path, CONVERTED_DIR, target_format)
-        
+
         context.user_data["ready_audio_path"] = str(result_path)
         context.user_data["audio_state"] = "WATING_TITLE"
-        
+
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text="✏️ تم التحويل الرقمي بنجاح.\n\nالآن، أرسل **اسم الأغنية / العنوان الجديد**:",
@@ -469,7 +467,7 @@ async def handle_metadata_skip(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_photo_as_art(update: Update, context: ContextTypes.DEFAULT_TYPE, photo_obj):
     chat_id = update.message.chat_id
     status_msg = await update.message.reply_text("⏳ جاري معالجة وحقن البيانات الفنية المتقدمة داخل الغلاف...")
-    
+
     try:
         filename = f"art_{photo_obj.file_unique_id}.jpg"
         art_path = await download_telegram_file(context, photo_obj.file_id, photo_obj.file_unique_id, filename)
@@ -482,15 +480,21 @@ async def handle_photo_as_art(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    # *** الإصلاح: قراءة جميع البيانات أولاً ثم تنظيف الحالة فوراً بغض النظر عن أي خطأ ***
     audio_path_str = context.user_data.get("ready_audio_path")
+    title = context.user_data.get("meta_title")
+    artist = context.user_data.get("meta_artist")
+    art_path_str = context.user_data.get("meta_art_path")
+
+    # تنظيف الحالة دائماً قبل أي عملية، لضمان عدم بقاء audio_state معلقاً
+    for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path", "pending_audio"]:
+        context.user_data.pop(key, None)
+
     if not audio_path_str:
         await context.bot.send_message(chat_id=chat_id, text="❌ لم يتم العثور على ملف جاهز للبث.")
         return
 
     audio_path = Path(audio_path_str)
-    title = context.user_data.get("meta_title")
-    artist = context.user_data.get("meta_artist")
-    art_path_str = context.user_data.get("meta_art_path")
     art_path = Path(art_path_str) if art_path_str else None
 
     # تشغيل منطق التعديل المبني على Mutagen في الخيط المنفصل (Thread Pool) لضمان عدم تعليق البوت
@@ -507,10 +511,6 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
             caption="✅ تم تحديث الـ Tags وحقن الغلاف بنجاح عبر Mutagen!"
         )
 
-    # تنظيف متغيرات الجلسة
-    for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path", "pending_audio"]:
-        context.user_data.pop(key, None)
-
 
 # ----------------------------------------------------------------------
 # بقية العمليات والوظائف الأساسية للبوت
@@ -521,7 +521,7 @@ async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_T
     if "image_album" not in context.chat_data:
         context.chat_data["image_album"] = []
     context.chat_data["image_album"].append({"file_id": file_id, "file_unique_id": file_unique_id, "filename": filename})
-    
+
     job_name = f"img_job_{chat_id}"
     for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
@@ -530,13 +530,22 @@ async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_T
 
 async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
     album = context.chat_data.get("image_album", [])
-    if not album: return
-    await context.bot.send_message(
-        chat_id=context.job.chat_id,
-        text=f"🖼️ تم استقبال {len(album)} صور بنجاح. اختر صيغة الإخراج المستهدفة المجمعة:",
-        reply_to_message_id=context.job.data["message_id"],
-        reply_markup=image_format_keyboard()
-    )
+    if not album:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=context.job.chat_id,
+            text=f"🖼️ تم استقبال {len(album)} صور بنجاح. اختر صيغة الإخراج المستهدفة المجمعة:",
+            reply_to_message_id=context.job.data["message_id"],
+            reply_markup=image_format_keyboard()
+        )
+    except Exception:
+        # إذا فشل الرد على الرسالة الأصلية، نرسل بدون reply
+        await context.bot.send_message(
+            chat_id=context.job.chat_id,
+            text=f"🖼️ تم استقبال {len(album)} صور بنجاح. اختر صيغة الإخراج المستهدفة المجمعة:",
+            reply_markup=image_format_keyboard()
+        )
 
 
 async def handle_image_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
@@ -579,13 +588,14 @@ async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     context.user_data["pending_pdf"] = {"file_id": tg_file.file_id, "file_unique_id": tg_file.file_unique_id, "filename": filename}
-    await update.message.reply_text("📄 أكد رغبتك في تحويل مستند الـ PDF الحالي إلى صيغة Word Word Word:", reply_markup=pdf_target_keyboard())
+    await update.message.reply_text("📄 أكد رغبتك في تحويل مستند الـ PDF الحالي إلى صيغة Word:", reply_markup=pdf_target_keyboard())
 
 
 async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
     query = update.callback_query
     pending = context.user_data.get("pending_pdf")
-    if not pending: return
+    if not pending:
+        return
     await query.edit_message_text("⏳ جاري هندسة وتفكيك ملف الـ PDF إلى مستند Word...")
     try:
         lp = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
@@ -623,7 +633,8 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
                 if path.is_file() and (now - path.stat().st_mtime) > FILE_MAX_AGE:
                     path.unlink()
                     removed += 1
-            except OSError: pass
+            except OSError:
+                pass
     if removed:
         logger.info(f"🧹 تم حذف {removed} من الملفات المؤقتة القديمة بنجاح.")
 
