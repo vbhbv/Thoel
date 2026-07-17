@@ -624,7 +624,6 @@ def main():
         connect_timeout=30.0,
         read_timeout=60.0,
         write_timeout=30.0,
-        pool_size=8
     )
 
     app = (
