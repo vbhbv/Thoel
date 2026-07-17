@@ -3,7 +3,7 @@
 - Word <-> PDF
 - تحويل الصوت لعدة صيغ
 - تحويل الصور (المجمعة والمفردة) إلى PDF أو Word
-مصمم للنشر على Railway
+مصمم للنشر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري
 """
 
 import os
@@ -90,7 +90,7 @@ async def download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: st
 
 
 # ----------------------------------------------------------------------
-# منطق التحويل
+# منطق التحويل (مع تفعيل إدارة الذاكرة الصارمة)
 # ----------------------------------------------------------------------
 
 async def convert_docx_to_pdf(input_path: Path, out_dir: Path) -> Path:
@@ -137,7 +137,7 @@ async def convert_audio(input_path: Path, out_dir: Path, target_format: str) -> 
 
 
 async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_name: str) -> Path:
-    """تحويل قائمة صور مجمعة إلى ملف PDF واحد."""
+    """تحويل قائمة صور مجمعة إلى ملف PDF واحد مع تحرير الذاكرة العشوائية فوراً."""
     output_path = out_dir / (base_name + ".pdf")
 
     def _convert():
@@ -146,17 +146,19 @@ async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_nam
 
         processed_paths = []
         for path in input_paths:
-            img = Image.open(path)
-            if img.mode in ("RGBA", "P", "LA"):
-                img = img.convert("RGB")
-            tmp_path = path.with_suffix(".conv.jpg")
-            img.save(tmp_path, "JPEG", quality=95)
-            processed_paths.append(str(tmp_path))
+            # استخدام context manager لإغلاق الصورة فوراً وتفريغ الـ RAM
+            with Image.open(path) as img:
+                if img.mode in ("RGBA", "P", "LA"):
+                    img = img.convert("RGB")
+                tmp_path = path.with_suffix(".conv.jpg")
+                img.save(tmp_path, "JPEG", quality=95)
+                processed_paths.append(str(tmp_path))
 
         pdf_bytes = img2pdf.convert(processed_paths)
         with open(output_path, "wb") as f:
             f.write(pdf_bytes)
 
+        # حذف الصور المؤقتة فوراً لتوفير مساحة القرص
         for p in processed_paths:
             try:
                 Path(p).unlink(missing_ok=True)
@@ -172,7 +174,7 @@ async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_nam
 
 
 async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_name: str) -> Path:
-    """تحويل مجموعة صور مجمعة إلى ملف Word واحد (تُدرج الصور بالتوالي)."""
+    """تحويل مجموعة صور مجمعة إلى ملف Word واحد مع إغلاق كتل الصور بعد الاستخدام."""
     output_path = out_dir / (base_name + ".docx")
 
     def _convert():
@@ -182,14 +184,14 @@ async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_na
 
         doc = Document()
         for path in input_paths:
-            img = Image.open(path)
-            if img.mode in ("RGBA", "P", "LA"):
-                img = img.convert("RGB")
-                fixed_path = path.with_suffix(".conv.jpg")
-                img.save(fixed_path, "JPEG", quality=95)
-                source = fixed_path
-            else:
-                source = path
+            with Image.open(path) as img:
+                if img.mode in ("RGBA", "P", "LA"):
+                    img = img.convert("RGB")
+                    fixed_path = path.with_suffix(".conv.jpg")
+                    img.save(fixed_path, "JPEG", quality=95)
+                    source = fixed_path
+                else:
+                    source = path
 
             doc.add_picture(str(source), width=Inches(6))
             if source != path:
@@ -245,7 +247,6 @@ def image_format_keyboard() -> InlineKeyboardMarkup:
 
 
 def pdf_target_keyboard() -> InlineKeyboardMarkup:
-    """عند استقبال PDF: خيار التحويل إلى Word فقط."""
     buttons = [
         [
             InlineKeyboardButton("📝 Word", callback_data="pdftarget_word"),
@@ -255,7 +256,7 @@ def pdf_target_keyboard() -> InlineKeyboardMarkup:
 
 
 # ----------------------------------------------------------------------
-# أوامر البوت
+# أوامر البوت واصطياد الرسائل
 # ----------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,7 +330,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
-# استقبال الملفات
+# استقبال واستجابة الملفات
 # ----------------------------------------------------------------------
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -341,12 +342,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = document.file_name or "file"
     ext = Path(filename).suffix.lower()
 
-    # كشف تلقائي إن كان صوتيًا يُرسل كمستند
     if ext in AUDIO_EXTENSIONS:
         await prompt_audio_format(update, context, document, filename)
         return
 
-    # كشف تلقائي إن كانت صورة تُرسل كمستند (لتفادي ضغط تليجرام للصور)
     if ext in IMAGE_EXTENSIONS:
         await queue_image_processing(update, context, document.file_id, document.file_unique_id, filename)
         return
@@ -370,8 +369,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """استقبال صورة مرسلة كـ Photo (مضغوطة من تليجرام)."""
-    photo = update.message.photo[-1]  # أعلى دقة متاحة
+    photo = update.message.photo[-1]
     filename = f"{photo.file_unique_id}.jpg"
     await queue_image_processing(update, context, photo.file_id, photo.file_unique_id, filename)
 
@@ -379,7 +377,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- مؤقت تجميع الصور ----------
 
 async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, file_unique_id: str, filename: str):
-    """تقوم بتجميع الصور القادمة في نفس الوقت وتأخير معالجتها حتى تكتمل المجموعة."""
     chat_id = update.message.chat_id
     
     if "image_album" not in context.chat_data:
@@ -391,7 +388,6 @@ async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_T
         "filename": filename
     })
     
-    # إلغاء المؤقت القديم وجدولة مؤقت جديد (ينتظر ثانيتين للاستقرار بعد آخر صورة وصلت)
     job_name = f"img_job_{chat_id}"
     current_jobs = context.job_queue.get_jobs_by_name(job_name)
     for job in current_jobs:
@@ -407,7 +403,6 @@ async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
-    """عرض زر اختيار نوع التحويل لكافة الصور بعد انتهاء مهلة التجميع."""
     job_data = context.job.data
     album_size = len(context.chat_data.get("image_album", []))
     
@@ -422,7 +417,7 @@ async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- Word -> PDF ----------
+# ---------- معالجات التحويل ----------
 
 async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
@@ -440,8 +435,6 @@ async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.exception("word2pdf error")
         await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
 
-
-# ---------- PDF -> Word ----------
 
 async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -471,7 +464,6 @@ async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEF
         local_path = await download_telegram_file(
             context, pending["file_id"], pending["file_unique_id"], pending["filename"]
         )
-
         result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
 
         with open(result_path, "rb") as f:
@@ -488,8 +480,6 @@ async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEF
     finally:
         context.user_data.pop("pending_pdf", None)
 
-
-# ---------- EPUB -> PDF ----------
 
 async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
@@ -514,8 +504,6 @@ async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.exception("epub2pdf error")
         await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
 
-
-# ---------- الصوت ----------
 
 async def prompt_audio_format(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -560,8 +548,6 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
     finally:
         context.user_data.pop("pending_audio", None)
 
-
-# ---------- الصور ----------
 
 async def handle_image_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
     query = update.callback_query
@@ -612,13 +598,14 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     for folder in (DOWNLOADS_DIR, CONVERTED_DIR):
         for path in folder.glob("*"):
             try:
+                # حذف الملفات إذا تجاوز عمرها ساعة واحدة (FILE_MAX_AGE)
                 if path.is_file() and (now - path.stat().st_mtime) > FILE_MAX_AGE:
                     path.unlink()
                     removed += 1
             except OSError:
                 pass
     if removed:
-        logger.info(f"🧹 تم حذف {removed} ملف مؤقت خلال التنظيف الدوري.")
+        logger.info(f"🧹 تم حذف {removed} ملف مؤقت خلال التنظيف الدوري لتوفير المساحة.")
 
 
 # ----------------------------------------------------------------------
@@ -631,7 +618,6 @@ def main():
             "⚠️ Calibre (ebook-convert) غير مثبت. ميزة EPUB ➜ PDF لن تعمل حتى يتم تثبيته."
         )
 
-    # بناء التطبيق مع تفعيل ودعم الـ JobQueue بشكل صريح لحل مشكلة عدم بدء المجدول تلقائياً
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -641,10 +627,10 @@ def main():
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # جدولة مهام التنظيف الدوري للملفات المؤقتة
+    # جدولة التنظيف الدوري
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
-    logger.info("🚀 البوت يعمل الآن...")
+    logger.info("🚀 البوت يعمل الآن بكفاءة وبأمان كامل للذاكرة...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
