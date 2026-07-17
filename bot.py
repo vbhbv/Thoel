@@ -1,6 +1,7 @@
 """
 بوت تليجرام لتحويل الصيغ
 - Word <-> PDF
+- PDF <-> EPUB
 - تحويل الصوت لعدة صيغ
 - تحويل الصور إلى PDF أو Word
 مصمم للنشر على Railway
@@ -20,6 +21,13 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
+)
+
+from pdf_epub_converter import (
+    convert_pdf_to_epub,
+    convert_epub_to_pdf,
+    is_calibre_available,
+    EbookConversionError,
 )
 
 # ----------------------------------------------------------------------
@@ -54,6 +62,7 @@ AUDIO_FORMATS = ["mp3", "wav", "ogg", "flac", "m4a", "aac"]
 
 DOC_EXTENSIONS = {".doc", ".docx"}
 PDF_EXTENSION = ".pdf"
+EPUB_EXTENSION = ".epub"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".wma"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
@@ -71,6 +80,15 @@ async def run_cmd(*args: str) -> tuple[int, str, str]:
     )
     stdout, stderr = await process.communicate()
     return process.returncode, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
+
+
+async def download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: str, file_unique_id: str, filename: str) -> Path:
+    """تنزيل ملف من تليجرام إلى مجلد downloads المحلي."""
+    file_obj = await context.bot.get_file(file_id)
+    ext = Path(filename).suffix or ""
+    local_path = DOWNLOADS_DIR / f"{file_unique_id}{ext}"
+    await file_obj.download_to_drive(custom_path=str(local_path))
+    return local_path
 
 
 # ----------------------------------------------------------------------
@@ -190,6 +208,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
+        [InlineKeyboardButton("📚 PDF ⇄ EPUB", callback_data="mode_ebook")],
         [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
         [InlineKeyboardButton("🖼️ تحويل صورة إلى PDF/Word", callback_data="mode_image")],
         [InlineKeyboardButton("ℹ️ مساعدة", callback_data="mode_help")],
@@ -220,6 +239,17 @@ def image_format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def pdf_target_keyboard() -> InlineKeyboardMarkup:
+    """عند استقبال PDF: نسأل المستخدم إن كان يريده كـ Word أو EPUB."""
+    buttons = [
+        [
+            InlineKeyboardButton("📝 Word", callback_data="pdftarget_word"),
+            InlineKeyboardButton("📚 EPUB", callback_data="pdftarget_epub"),
+        ]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 # ----------------------------------------------------------------------
 # أوامر البوت
 # ----------------------------------------------------------------------
@@ -228,7 +258,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     text = (
         "👋 أهلًا بك في بوت تحويل الصيغ!\n\n"
-        "🔹 أرسل ملف Word أو PDF مباشرة وسأكتشف نوعه وأحوّله تلقائيًا.\n"
+        "🔹 أرسل ملف Word وسيتحول تلقائيًا إلى PDF.\n"
+        "🔹 أرسل ملف PDF وسأسألك: Word أم EPUB؟\n"
+        "🔹 أرسل ملف EPUB وسيتحول تلقائيًا إلى PDF.\n"
         "🔹 أرسل ملف أو مقطع صوتي وسأعرض عليك أزرار الصيغ المتاحة.\n"
         "🔹 أرسل صورة وسأعرض عليك تحويلها إلى PDF أو Word.\n"
         "🔹 أو اختر من القائمة بالأسفل.\n\n"
@@ -241,9 +273,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📌 طريقة الاستخدام:\n"
         "1. أرسل ملف Word (.doc/.docx) لتحويله إلى PDF تلقائيًا.\n"
-        "2. أرسل ملف PDF لتحويله إلى Word تلقائيًا.\n"
-        "3. أرسل ملف/مقطع صوتي، ثم اختر الصيغة المطلوبة من الأزرار.\n"
-        "4. أرسل صورة، ثم اختر تحويلها إلى PDF أو Word.\n\n"
+        "2. أرسل ملف PDF ثم اختر تحويله إلى Word أو EPUB.\n"
+        "3. أرسل ملف EPUB لتحويله إلى PDF تلقائيًا.\n"
+        "4. أرسل ملف/مقطع صوتي، ثم اختر الصيغة المطلوبة من الأزرار.\n"
+        "5. أرسل صورة، ثم اختر تحويلها إلى PDF أو Word.\n\n"
         "الأوامر:\n"
         "/start - القائمة الرئيسية\n"
         "/help - المساعدة"
@@ -261,6 +294,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "mode_pdf2word":
         context.user_data["mode"] = "pdf2word"
         await query.edit_message_text("📄 أرسل الآن ملف PDF لتحويله إلى Word.")
+    elif data == "mode_ebook":
+        context.user_data["mode"] = "ebook"
+        await query.edit_message_text(
+            "📚 أرسل الآن ملف PDF (سأسألك عن الصيغة الهدف) أو ملف EPUB (يتحول تلقائيًا إلى PDF)."
+        )
     elif data == "mode_audio":
         context.user_data["mode"] = "audio"
         await query.edit_message_text("🎵 أرسل الآن الملف أو المقطع الصوتي المراد تحويله.")
@@ -271,7 +309,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "mode_help":
         await query.edit_message_text(
-            "أرسل ملف Word أو PDF وسيتم اكتشاف نوعه تلقائيًا وتحويله.\n"
+            "أرسل ملف Word وسيتحول تلقائيًا إلى PDF.\n"
+            "أرسل ملف PDF وسأسألك: Word أم EPUB؟\n"
+            "أرسل ملف EPUB ويتحول تلقائيًا إلى PDF.\n"
             "أرسل ملفًا صوتيًا وستظهر لك أزرار لاختيار الصيغة الهدف.\n"
             "أرسل صورة وستظهر لك أزرار لتحويلها إلى PDF أو Word."
         )
@@ -281,6 +321,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("imgfmt_"):
         target_format = data.split("_", 1)[1]
         await handle_image_conversion(update, context, target_format)
+    elif data.startswith("pdftarget_"):
+        target_format = data.split("_", 1)[1]
+        await handle_pdf_target_conversion(update, context, target_format)
 
 
 # ----------------------------------------------------------------------
@@ -309,10 +352,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ext in DOC_EXTENSIONS:
         await process_word_to_pdf(update, context, document, filename)
     elif ext == PDF_EXTENSION:
-        await process_pdf_to_word(update, context, document, filename)
+        # PDF قد يُراد تحويله إلى Word أو EPUB، لذا نسأل المستخدم
+        await prompt_pdf_target(update, context, document, filename)
+    elif ext == EPUB_EXTENSION:
+        await process_epub_to_pdf(update, context, document, filename)
     else:
         await update.message.reply_text(
-            "⚠️ صيغة غير مدعومة حاليًا. أرسل ملف Word أو PDF أو ملفًا صوتيًا أو صورة."
+            "⚠️ صيغة غير مدعومة حاليًا. أرسل ملف Word أو PDF أو EPUB أو ملفًا صوتيًا أو صورة."
         )
 
 
@@ -334,11 +380,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
     try:
-        file_obj = await context.bot.get_file(tg_file.file_id)
-        ext = Path(filename).suffix or ""
-        local_path = DOWNLOADS_DIR / f"{tg_file.file_unique_id}{ext}"
-        await file_obj.download_to_drive(custom_path=str(local_path))
-
+        local_path = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
         result_path = await convert_docx_to_pdf(local_path, CONVERTED_DIR)
         with open(result_path, "rb") as f:
             await update.message.reply_document(
@@ -352,26 +394,88 @@ async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
 
 
-# ---------- PDF -> Word ----------
+# ---------- PDF -> (Word / EPUB) ----------
 
-async def process_pdf_to_word(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
-    status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى Word...")
+async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
+    if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        await update.message.reply_text(f"⚠️ الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} ميغابايت).")
+        return
+
+    context.user_data["pending_pdf"] = {
+        "file_id": tg_file.file_id,
+        "file_unique_id": tg_file.file_unique_id,
+        "filename": filename,
+    }
+    await update.message.reply_text(
+        "📄 اختر الصيغة التي تريد تحويل PDF إليها:",
+        reply_markup=pdf_target_keyboard(),
+    )
+
+
+async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
+    query = update.callback_query
+    pending = context.user_data.get("pending_pdf")
+    if not pending:
+        await query.edit_message_text("⚠️ لم يتم العثور على ملف PDF. أرسل الملف من جديد.")
+        return
+
+    label = "Word" if target_format == "word" else "EPUB"
+    await query.edit_message_text(f"⏳ جاري التحويل إلى {label}...")
     try:
-        file_obj = await context.bot.get_file(tg_file.file_id)
-        ext = Path(filename).suffix or ""
-        local_path = DOWNLOADS_DIR / f"{tg_file.file_unique_id}{ext}"
-        await file_obj.download_to_drive(custom_path=str(local_path))
+        local_path = await download_telegram_file(
+            context, pending["file_id"], pending["file_unique_id"], pending["filename"]
+        )
 
-        result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
+        if target_format == "word":
+            result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
+        else:
+            if not is_calibre_available():
+                raise EbookConversionError(
+                    "خاصية EPUB غير مفعّلة على هذا الخادم (Calibre غير مثبت)."
+                )
+            result_path = await convert_pdf_to_epub(local_path, CONVERTED_DIR)
+
+        with open(result_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=f,
+                filename=result_path.name,
+                caption=f"✅ تم التحويل إلى {label} بنجاح.",
+            )
+        await query.delete_message()
+    except EbookConversionError as e:
+        logger.exception("pdf2epub error")
+        await query.edit_message_text(f"❌ {e}")
+    except Exception as e:
+        logger.exception("pdf target conversion error")
+        await query.edit_message_text(f"❌ حدث خطأ أثناء التحويل: {e}")
+    finally:
+        context.user_data.pop("pending_pdf", None)
+
+
+# ---------- EPUB -> PDF ----------
+
+async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
+    status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
+    try:
+        if not is_calibre_available():
+            await status_msg.edit_text("❌ خاصية EPUB غير مفعّلة على هذا الخادم (Calibre غير مثبت).")
+            return
+
+        local_path = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
+        result_path = await convert_epub_to_pdf(local_path, CONVERTED_DIR)
         with open(result_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename=result_path.name,
-                caption="✅ تم التحويل إلى Word بنجاح.",
+                caption="✅ تم التحويل إلى PDF بنجاح.",
             )
         await status_msg.delete()
+    except EbookConversionError as e:
+        logger.exception("epub2pdf error")
+        await status_msg.edit_text(f"❌ {e}")
     except Exception as e:
-        logger.exception("pdf2word error")
+        logger.exception("epub2pdf error")
         await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
 
 
@@ -402,11 +506,9 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
 
     await query.edit_message_text(f"⏳ جاري التحويل إلى {target_format.upper()}...")
     try:
-        file_obj = await context.bot.get_file(pending["file_id"])
-        ext = Path(pending["filename"]).suffix or ".audio"
-        local_path = DOWNLOADS_DIR / f"{pending['file_unique_id']}{ext}"
-        await file_obj.download_to_drive(custom_path=str(local_path))
-
+        local_path = await download_telegram_file(
+            context, pending["file_id"], pending["file_unique_id"], pending["filename"]
+        )
         result_path = await convert_audio(local_path, CONVERTED_DIR, target_format)
         with open(result_path, "rb") as f:
             await context.bot.send_document(
@@ -451,10 +553,9 @@ async def handle_image_conversion(update: Update, context: ContextTypes.DEFAULT_
     label = "PDF" if target_format == "pdf" else "Word"
     await query.edit_message_text(f"⏳ جاري التحويل إلى {label}...")
     try:
-        file_obj = await context.bot.get_file(pending["file_id"])
-        ext = Path(pending["filename"]).suffix or ".jpg"
-        local_path = DOWNLOADS_DIR / f"{pending['file_unique_id']}{ext}"
-        await file_obj.download_to_drive(custom_path=str(local_path))
+        local_path = await download_telegram_file(
+            context, pending["file_id"], pending["file_unique_id"], pending["filename"]
+        )
 
         if target_format == "pdf":
             result_path = await convert_image_to_pdf(local_path, CONVERTED_DIR)
@@ -500,6 +601,11 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------
 
 def main():
+    if not is_calibre_available():
+        logger.warning(
+            "⚠️ Calibre (ebook-convert) غير مثبت. ميزة PDF⇄EPUB لن تعمل حتى يتم تثبيته."
+        )
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
