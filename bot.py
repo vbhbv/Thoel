@@ -1,7 +1,7 @@
 """
-بوت تليجرام لتحويل الصيغ
+بوت تليجرام لتحويل الصيغ وتعديل الـ Metadata للصوتيات
 - Word <-> PDF
-- تحويل الصوت لعدة صيغ
+- تحويل الصوت لعدة صيغ + تعديل البيانات (العنوان، الفنان، البوستر)
 - تحويل الصور (المجمعة والمفردة) إلى PDF أو Word
 مصمم للنشر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري
 """
@@ -91,8 +91,25 @@ async def download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: st
 
 
 # ----------------------------------------------------------------------
-# منطق التحويل (مع تفعيل إدارة الذاكرة الصارمة)
+# منطق التحويل والـ Metadata (إدارة الذاكرة الصارمة)
 # ----------------------------------------------------------------------
+
+def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None, album_art_path: Path = None):
+    """تعديل الـ tags والبيانات الوصفية للملف الصوتي وحقن الغلاف."""
+    import music_tag
+    try:
+        f = music_tag.load_file(str(audio_path))
+        if title:
+            f['title'] = title
+        if artist:
+            f['artist'] = artist
+        if album_art_path:
+            with open(album_art_path, 'rb') as img_f:
+                f['artwork'] = img_f.read()
+        f.save()
+    except Exception as e:
+        logger.error(f"خطأ أثناء تعديل بيانات الصوت الوصفية: {e}")
+
 
 async def convert_docx_to_pdf(input_path: Path, out_dir: Path) -> Path:
     """تحويل Word إلى PDF باستخدام LibreOffice (headless)."""
@@ -147,7 +164,6 @@ async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_nam
 
         processed_paths = []
         for path in input_paths:
-            # استخدام context manager لإغلاق الصورة فوراً وتفريغ الـ RAM
             with Image.open(path) as img:
                 if img.mode in ("RGBA", "P", "LA"):
                     img = img.convert("RGB")
@@ -159,7 +175,6 @@ async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_nam
         with open(output_path, "wb") as f:
             f.write(pdf_bytes)
 
-        # حذف الصور المؤقتة فوراً لتوفير مساحة القرص
         for p in processed_paths:
             try:
                 Path(p).unlink(missing_ok=True)
@@ -237,6 +252,13 @@ def audio_format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def metadata_skip_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("⏭️ تخطي هذه الخطوة", callback_data="meta_skip")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def image_format_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [
@@ -263,13 +285,12 @@ def pdf_target_keyboard() -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     text = (
-        "👋 أهلًا بك في بوت تحويل الصيغ!\n\n"
+        "👋 أهلًا بك في بوت تحويل الصيغ وتعديل الصوتيات!\n\n"
         "🔹 أرسل ملف Word وسيتحول تلقائيًا إلى PDF.\n"
         "🔹 أرسل ملف PDF وستحوله إلى Word.\n"
         "🔹 أرسل ملف EPUB وسيتحول تلقائيًا إلى PDF.\n"
-        "🔹 أرسل ملف أو مقطع صوتي وسأعرض عليك أزرار الصيغ المتاحة.\n"
-        "🔹 أرسل صورة أو مجموعة صور (مجمعة) وسأحولها لك إلى ملف PDF أو Word واحد.\n"
-        "🔹 أو اختر من القائمة بالأسفل.\n\n"
+        "🔹 أرسل ملفًا صوتيًا وسنتيح لك تعديل بيانات الأغنية (الاسم، الفنان، البوستر) أو تحويل صيغته.\n"
+        "🔹 أرسل صورة أو مجموعة صور وسأحولها لك إلى ملف PDF أو Word واحد.\n\n"
         f"⚠️ الحد الأقصى لحجم الملف: {MAX_FILE_SIZE_MB} ميغابايت."
     )
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
@@ -281,8 +302,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. أرسل ملف Word (.doc/.docx) لتحويله إلى PDF تلقائيًا.\n"
         "2. أرسل ملف PDF ثم اختر تحويله إلى Word.\n"
         "3. أرسل ملف EPUB لتحويله إلى PDF تلقائيًا.\n"
-        "4. أرسل ملف/مقطع صوتي، ثم اختر الصيغة المطلوبة من الأزرار.\n"
-        "5. أرسل صورة أو عدة صور معاً، ثم اختر تحويلها إلى PDF أو Word مجمع.\n\n"
+        "4. أرسل ملف صوتي، للتعديل على بياناته الفنية أو تحويل امتداده.\n"
+        "5. أرسل مجموعة صور لتحويلها إلى مستند مجمع.\n\n"
         "الأوامر:\n"
         "/start - القائمة الرئيسية\n"
         "/help - المساعدة"
@@ -305,23 +326,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📚 أرسل الآن ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
     elif data == "mode_audio":
         context.user_data["mode"] = "audio"
-        await query.edit_message_text("🎵 أرسل الآن الملف أو المقطع الصوتي المراد تحويله.")
+        await query.edit_message_text("🎵 أرسل الآن الملف أو المقطع الصوتي المراد تعديله أو تحويله.")
     elif data == "mode_image":
         context.user_data["mode"] = "image"
-        await query.edit_message_text(
-            "🖼️ أرسل الآن الصورة أو مجموعة الصور المراد تجميعها وتحويلها (يمكنك إرسالها كصور عادية أو كملفات)."
-        )
+        await query.edit_message_text("🖼️ أرسل الآن الصورة أو مجموعة الصور المراد تجميعها.")
     elif data == "mode_help":
-        await query.edit_message_text(
-            "أرسل ملف Word وسيتحول تلقائيًا إلى PDF.\n"
-            "أرسل ملف PDF وستحوله إلى Word.\n"
-            "أرسل ملف EPUB ويتحول تلقائيًا إلى PDF.\n"
-            "أرسل ملفًا صوتيًا وستظهر لك أزرار لاختيار الصيغة الهدف.\n"
-            "أرسل صورة أو عدة صور مجمعة لتجميعها داخل ملف PDF أو Word واحد."
-        )
+        await query.edit_message_text("يمكنك إرسال أي ملف مباشرة وسيتعامل معه البوت بذكاء حسب صيغته.")
     elif data.startswith("audiofmt_"):
         target_format = data.split("_", 1)[1]
         await handle_audio_conversion(update, context, target_format)
+    elif data == "meta_skip":
+        await handle_metadata_skip(update, context)
     elif data.startswith("imgfmt_"):
         target_format = data.split("_", 1)[1]
         await handle_image_conversion(update, context, target_format)
@@ -331,10 +346,15 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
-# استقبال واستجابة الملفات
+# استقبال واستجابة الملفات والرسائل النصية
 # ----------------------------------------------------------------------
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # حماية: إذا كان البوت ينتظر نصوصاً لتعديل الصوت، لا نقبل مستندات عادية إلا إذا كانت غلافاً
+    if "audio_state" in context.user_data and context.user_data["audio_state"] == "WATING_ART":
+        await handle_photo_as_art(update, context, update.message.document)
+        return
+
     document = update.message.document
     if document.file_size and document.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         await update.message.reply_text(f"⚠️ الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} ميغابايت).")
@@ -358,42 +378,67 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif ext == EPUB_EXTENSION:
         await process_epub_to_pdf(update, context, document, filename)
     else:
-        await update.message.reply_text(
-            "⚠️ صيغة غير مدعومة حاليًا. أرسل ملف Word أو PDF أو EPUB أو ملفًا صوتيًا أو صورة."
-        )
+        await update.message.reply_text("⚠️ صيغة غير مدعومة حاليًا.")
 
 
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audio = update.message.audio or update.message.voice
-    filename = getattr(audio, "file_name", None) or "audio.ogg"
+    filename = getattr(audio, "file_name", None) or "audio.mp3"
     await prompt_audio_format(update, context, audio, filename)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # إذا كنا ننتظر غلافاً للصوتية من نوع صورة عادية
+    if "audio_state" in context.user_data and context.user_data["audio_state"] == "WATING_ART":
+        photo = update.message.photo[-1]
+        await handle_photo_as_art(update, context, photo)
+        return
+
     photo = update.message.photo[-1]
     filename = f"{photo.file_unique_id}.jpg"
     await queue_image_processing(update, context, photo.file_id, photo.file_unique_id, filename)
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة المدخلات النصية عندما يكتب المستخدم اسم الأغنية أو الفنان."""
+    state = context.user_data.get("audio_state")
+    if not state:
+        return  # تجاهل الرسائل النصية العادية إن لم نكن في مرحلة تعديل الصوت
+
+    text = update.message.text.strip()
+
+    if state == "WATING_TITLE":
+        context.user_data["meta_title"] = text
+        context.user_data["audio_state"] = "WATING_ARTIST"
+        await update.message.reply_text(
+            "👤 ممتاز، أرسل الآن **اسم الفنان** (أو المغني):",
+            reply_markup=metadata_skip_keyboard()
+        )
+
+    elif state == "WATING_ARTIST":
+        context.user_data["meta_artist"] = text
+        context.user_data["audio_state"] = "WATING_ART"
+        await update.message.reply_text(
+            "🖼️ أخيراً، أرسل **صورة الغلاف** المرجوة للأغنية:\n(يمكن إرسالها كصورة عادية أو ملف)",
+            reply_markup=metadata_skip_keyboard()
+        )
 
 
 # ---------- مؤقت تجميع الصور ----------
 
 async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, file_unique_id: str, filename: str):
     chat_id = update.message.chat_id
-    
     if "image_album" not in context.chat_data:
         context.chat_data["image_album"] = []
-        
     context.chat_data["image_album"].append({
         "file_id": file_id,
         "file_unique_id": file_unique_id,
         "filename": filename
     })
-    
     job_name = f"img_job_{chat_id}"
     current_jobs = context.job_queue.get_jobs_by_name(job_name)
     for job in current_jobs:
         job.schedule_removal()
-        
     context.job_queue.run_once(
         trigger_image_prompt,
         when=2.0,
@@ -406,10 +451,8 @@ async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_T
 async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
     album_size = len(context.chat_data.get("image_album", []))
-    
     if album_size == 0:
         return
-        
     await context.bot.send_message(
         chat_id=context.job.chat_id,
         text=f"🖼️ تم استقبال {album_size} من الصور. اختر الصيغة المجمعة التي تريد التحويل إليها:",
@@ -418,93 +461,7 @@ async def trigger_image_prompt(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- معالجات التحويل ----------
-
-async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
-    status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
-    try:
-        local_path = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
-        result_path = await convert_docx_to_pdf(local_path, CONVERTED_DIR)
-        with open(result_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=result_path.name,
-                caption="✅ تم التحويل إلى PDF بنجاح.",
-            )
-        await status_msg.delete()
-    except Exception as e:
-        logger.exception("word2pdf error")
-        await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
-
-
-async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
-    if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-        await update.message.reply_text(f"⚠️ الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} ميغابايت).")
-        return
-
-    context.user_data["pending_pdf"] = {
-        "file_id": tg_file.file_id,
-        "file_unique_id": tg_file.file_unique_id,
-        "filename": filename,
-    }
-    await update.message.reply_text(
-        "📄 اضغط على الزر لتأكيد تحويل ملف PDF إلى Word:",
-        reply_markup=pdf_target_keyboard(),
-    )
-
-
-async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
-    query = update.callback_query
-    pending = context.user_data.get("pending_pdf")
-    if not pending:
-        await query.edit_message_text("⚠️ لم يتم العثور على ملف PDF. أرسل الملف من جديد.")
-        return
-
-    await query.edit_message_text("⏳ جاري التحويل إلى Word...")
-    try:
-        local_path = await download_telegram_file(
-            context, pending["file_id"], pending["file_unique_id"], pending["filename"]
-        )
-        result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
-
-        with open(result_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=f,
-                filename=result_path.name,
-                caption="✅ تم التحويل إلى Word بنجاح.",
-            )
-        await query.delete_message()
-    except Exception as e:
-        logger.exception("pdf target conversion error")
-        await query.edit_message_text(f"❌ حدث خطأ أثناء التحويل: {e}")
-    finally:
-        context.user_data.pop("pending_pdf", None)
-
-
-async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
-    status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
-    try:
-        if not is_calibre_available():
-            await status_msg.edit_text("❌ خاصية EPUB غير مفعّلة على هذا الخادم (Calibre غير مثبت).")
-            return
-
-        local_path = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
-        result_path = await convert_epub_to_pdf(local_path, CONVERTED_DIR)
-        with open(result_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=result_path.name,
-                caption="✅ تم التحويل إلى PDF بنجاح.",
-            )
-        await status_msg.delete()
-    except EbookConversionError as e:
-        logger.exception("epub2pdf error")
-        await status_msg.edit_text(f"❌ {e}")
-    except Exception as e:
-        logger.exception("epub2pdf error")
-        await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
-
+# ---------- معالجات التحويل وتعديل الصوتيات ----------
 
 async def prompt_audio_format(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -517,7 +474,7 @@ async def prompt_audio_format(update: Update, context: ContextTypes.DEFAULT_TYPE
         "filename": filename,
     }
     await update.message.reply_text(
-        "🎵 اختر الصيغة التي تريد التحويل إليها:",
+        "🎵 اختر الصيغة المراد التحويل إليها لتأكيد العملية والبدء بتعديل تفاصيل الملف:",
         reply_markup=audio_format_keyboard(),
     )
 
@@ -526,65 +483,177 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     pending = context.user_data.get("pending_audio")
     if not pending:
-        await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتی. أرسل الملف من جديد.")
+        await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتي.")
         return
 
-    await query.edit_message_text(f"⏳ جاري التحويل إلى {target_format.upper()}...")
+    await query.edit_message_text(f"⏳ جاري معالجة الصوت والتحويل إلى {target_format.upper()}...")
     try:
-        local_path = await download_telegram_file(
-            context, pending["file_id"], pending["file_unique_id"], pending["filename"]
-        )
+        local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
         result_path = await convert_audio(local_path, CONVERTED_DIR, target_format)
-        with open(result_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=f,
-                filename=result_path.name,
-                caption=f"✅ تم التحويل إلى {target_format.upper()} بنجاح.",
-            )
+        
+        # حفظ مسار الملف الناتج للانتقال لمرحلة تعديل الـ Metadata
+        context.user_data["ready_audio_path"] = str(result_path)
+        context.user_data["audio_state"] = "WATING_TITLE"
+        
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✏️ تم التحويل الأولي بنجاح.\n\nالآن، أرسل **اسم الأغنية / التراك الجديد**:",
+            reply_markup=metadata_skip_keyboard()
+        )
         await query.delete_message()
     except Exception as e:
         logger.exception("audio conversion error")
         await query.edit_message_text(f"❌ حدث خطأ أثناء التحويل: {e}")
+
+
+async def handle_metadata_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """التعامل مع زر التخطي للمراحل المختلفة."""
+    query = update.callback_query
+    state = context.user_data.get("audio_state")
+
+    if state == "WATING_TITLE":
+        context.user_data["audio_state"] = "WATING_ARTIST"
+        await query.edit_message_text("👤 تم التخطي. أرسل الآن **اسم الفنان**:", reply_markup=metadata_skip_keyboard())
+    elif state == "WATING_ARTIST":
+        context.user_data["audio_state"] = "WATING_ART"
+        await query.edit_message_text("🖼️ تم التخطي. أرسل الآن **صورة الغلاف**:", reply_markup=metadata_skip_keyboard())
+    elif state == "WATING_ART":
+        # في حال تخطي الصورة أيضاً، نقوم بإنهاء وإرسال الملف فوراً دون تعديلات إضافية
+        await finalize_and_send_audio(query.message.chat_id, context)
+        await query.delete_message()
+
+
+async def handle_photo_as_art(update: Update, context: ContextTypes.DEFAULT_TYPE, photo_obj):
+    """استلام صورة الغلاف وتطبيق البيانات بالكامل على الملف الصوتي قبل الإرسال."""
+    chat_id = update.message.chat_id
+    status_msg = await update.message.reply_text("⏳ جاري حقن البيانات الفنية وصورة الغلاف داخل الملف الصوتي...")
+    
+    try:
+        # تحميل صورة الغلاف مؤقتاً
+        art_path = await download_telegram_file(context, photo_obj.file_id, photo_obj.file_unique_id, "art.jpg")
+        context.user_data["meta_art_path"] = str(art_path)
+    except Exception as e:
+        logger.error(f"فشل تحميل غلاف الصوت: {e}")
+
+    await finalize_and_send_audio(chat_id, context)
+    await status_msg.delete()
+
+
+async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """تطبيق البيانات المجمعة من المراحل وإرسال الملف النهائي للصوتية."""
+    audio_path_str = context.user_data.get("ready_audio_path")
+    if not audio_path_str:
+        await context.bot.send_message(chat_id=chat_id, text="❌ خطأ في النظام: لم يتم العثور على الملف الصوتي الجاهز.")
+        return
+
+    audio_path = Path(audio_path_str)
+    title = context.user_data.get("meta_title")
+    artist = context.user_data.get("meta_artist")
+    art_path_str = context.user_data.get("meta_art_path")
+    art_path = Path(art_path_str) if art_path_str else None
+
+    # تطبيق التعديلات باستخدام الدالة الفرعية المعتمدة على الـ Thread-pool
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, apply_audio_metadata, audio_path, title, artist, art_path)
+
+    # إرسال الملف النهائي للمستخدم
+    with open(audio_path, "rb") as f:
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=f,
+            title=title if title else audio_path.stem,
+            performer=artist if artist else "فنان غير معروف",
+            caption="✅ تم تحديث بيانات الصوت وتحويله بنجاح!"
+        )
+
+    # تنظيف حالة المستخدم لمنع أي تداخل مستقبلي
+    for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path"]:
+        context.user_data.pop(key, None)
+
+
+# ---------- بقية معالجات الأوفيس والصور المستقرة ----------
+
+async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
+    status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
+    try:
+        local_path = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
+        result_path = await convert_docx_to_pdf(local_path, CONVERTED_DIR)
+        with open(result_path, "rb") as f:
+            await update.message.reply_document(document=f, filename=result_path.name, caption="✅ تم التحويل إلى PDF بنجاح.")
+        await status_msg.delete()
+    except Exception as e:
+        logger.exception("word2pdf error")
+        await status_msg.edit_text(f"❌ حدث خطأ أثناء التحويل: {e}")
+
+
+async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
+    if getattr(tg_file, "file_size", None) and tg_file.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        await update.message.reply_text(f"⚠️ الملف أكبر من الحد المسموح.")
+        return
+    context.user_data["pending_pdf"] = {"file_id": tg_file.file_id, "file_unique_id": tg_file.file_unique_id, "filename": filename}
+    await update.message.reply_text("📄 اضغط على الزر لتأكيد تحويل ملف PDF إلى Word:", reply_markup=pdf_target_keyboard())
+
+
+async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
+    query = update.callback_query
+    pending = context.user_data.get("pending_pdf")
+    if not pending:
+        await query.edit_message_text("⚠️ لم يتم العثور على ملف PDF.")
+        return
+    await query.edit_message_text("⏳ جاري التحويل إلى Word...")
+    try:
+        local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
+        result_path = await convert_pdf_to_docx(local_path, CONVERTED_DIR)
+        with open(result_path, "rb") as f:
+            await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=result_path.name, caption="✅ تم التحويل بنجاح.")
+        await query.delete_message()
+    except Exception as e:
+        logger.exception("pdf target error")
+        await query.edit_message_text(f"❌ حدث خطأ: {e}")
     finally:
-        context.user_data.pop("pending_audio", None)
+        context.user_data.pop("pending_pdf", None)
+
+
+async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
+    status_msg = await update.message.reply_text("⏳ جاري تحميل الملف وتحويله إلى PDF...")
+    try:
+        if not is_calibre_available():
+            await status_msg.edit_text("❌ خاصية EPUB غير مفعّلة على هذا الخادم.")
+            return
+        local_path = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
+        result_path = await convert_epub_to_pdf(local_path, CONVERTED_DIR)
+        with open(result_path, "rb") as f:
+            await update.message.reply_document(document=f, filename=result_path.name, caption="✅ تم التحويل بنجاح.")
+        await status_msg.delete()
+    except Exception as e:
+        logger.exception("epub2pdf error")
+        await status_msg.edit_text(f"❌ حدث خطأ: {e}")
 
 
 async def handle_image_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
     query = update.callback_query
     album = context.chat_data.get("image_album")
-    
     if not album:
-        await query.edit_message_text("⚠️ لم يتم العثور على صور مجمعة. أرسل الصور من جديد.")
+        await query.edit_message_text("⚠️ لم يتم العثور على صور مجمعة.")
         return
-
     label = "PDF" if target_format == "pdf" else "Word"
-    await query.edit_message_text(f"⏳ جاري تحميل وتجميع {len(album)} صور وتحويلها إلى ملف {label} واحد...")
-    
+    await query.edit_message_text(f"⏳ جاري تجميع وتحويل {len(album)} صور...")
     try:
         local_paths = []
         for img_info in album:
             p = await download_telegram_file(context, img_info["file_id"], img_info["file_unique_id"], img_info["filename"])
             local_paths.append(p)
-            
         base_name = f"images_bundle_{int(time.time())}"
-        
         if target_format == "pdf":
             result_path = await convert_images_to_pdf(local_paths, CONVERTED_DIR, base_name)
         else:
             result_path = await convert_images_to_docx(local_paths, CONVERTED_DIR, base_name)
-
         with open(result_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=f,
-                filename=result_path.name,
-                caption=f"✅ تم تجميع وتحويل الصور إلى ملف {label} بنجاح.",
-            )
+            await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=result_path.name, caption=f"✅ تم التجميع بنجاح.")
         await query.delete_message()
     except Exception as e:
-        logger.exception("image conversion error")
-        await query.edit_message_text(f"❌ حدث خطأ أثناء تحويل وتجميع الصور: {e}")
+        logger.exception("image error")
+        await query.edit_message_text(f"❌ حدث خطأ: {e}")
     finally:
         context.chat_data.pop("image_album", None)
 
@@ -599,7 +668,6 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     for folder in (DOWNLOADS_DIR, CONVERTED_DIR):
         for path in folder.glob("*"):
             try:
-                # حذف الملفات إذا تجاوز عمرها ساعة واحدة (FILE_MAX_AGE)
                 if path.is_file() and (now - path.stat().st_mtime) > FILE_MAX_AGE:
                     path.unlink()
                     removed += 1
@@ -615,11 +683,8 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not is_calibre_available():
-        logger.warning(
-            "⚠️ Calibre (ebook-convert) غير مثبت. ميزة EPUB ➜ PDF لن تعمل حتى يتم تثبيته."
-        )
+        logger.warning("⚠️ Calibre (ebook-convert) غير مثبت.")
 
-    # تكوين مخصص لطلب الشبكة لتوسيع مهلة الاتصال ومنع الـ ConnectTimeout و الـ TimedOut على Railway
     request_config = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=60.0,
@@ -636,21 +701,18 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(menu_callback))
+    
+    # معالج النصوص لاستقبال المدخلات (اسم الأغنية والفنان) بالتزامن مع فلاتر الاستبعاد
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # جدولة التنظيف الدوري
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
-    logger.info("🚀 البوت يعمل الآن بكفاءة وبأمان كامل للذاكرة...")
-    
-    # تشغيل مستمع التحديثات مع تخطي التحديثات المعلقة القديمة منعاً للضغط وقت بدء التشغيل
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False
-    )
+    logger.info("🚀 البوت يعمل الآن بكفاءة وبميزة تعديل الـ Metadata الكاملة للصوتيات...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
 
 
 if __name__ == "__main__":
