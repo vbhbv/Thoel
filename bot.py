@@ -103,8 +103,9 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
             f['title'] = title
         if artist:
             f['artist'] = artist
-        if album_art_path:
+        if album_art_path and album_art_path.exists():
             with open(album_art_path, 'rb') as img_f:
+                # مكتبة music_tag تتعرف تلقائياً على صيغة البايتات عند إسنادها لـ artwork
                 f['artwork'] = img_f.read()
         f.save()
     except Exception as e:
@@ -529,8 +530,9 @@ async def handle_photo_as_art(update: Update, context: ContextTypes.DEFAULT_TYPE
     status_msg = await update.message.reply_text("⏳ جاري حقن البيانات الفنية وصورة الغلاف داخل الملف الصوتي...")
     
     try:
-        # تحميل صورة الغلاف مؤقتاً
-        art_path = await download_telegram_file(context, photo_obj.file_id, photo_obj.file_unique_id, "art.jpg")
+        # تحديد اسم افتراضي للصورة بناءً على المعرف الخاص بها لمنع التداخل
+        filename = f"art_{photo_obj.file_unique_id}.jpg"
+        art_path = await download_telegram_file(context, photo_obj.file_id, photo_obj.file_unique_id, filename)
         context.user_data["meta_art_path"] = str(art_path)
     except Exception as e:
         logger.error(f"فشل تحميل غلاف الصوت: {e}")
@@ -552,11 +554,11 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
     art_path_str = context.user_data.get("meta_art_path")
     art_path = Path(art_path_str) if art_path_str else None
 
-    # تطبيق التعديلات باستخدام الدالة الفرعية المعتمدة على الـ Thread-pool
+    # تطبيق التعديلات باستخدام الدالة الفرعية المعتمدة على الـ Thread-pool لعدم حظر عمل البوت
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, apply_audio_metadata, audio_path, title, artist, art_path)
 
-    # إرسال الملف النهائي للمستخدم
+    # إرسال الملف النهائي للمستخدم مع تفاصيل الـ Tag المحدثة
     with open(audio_path, "rb") as f:
         await context.bot.send_audio(
             chat_id=chat_id,
