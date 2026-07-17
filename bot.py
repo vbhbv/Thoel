@@ -1,6 +1,7 @@
 """
-بوت تليجرام لتحويل الصيغ وتعديل الـ Metadata للصوتيات
+بوت تليجرام لتحويل الصيغ وتعديل الـ Metadata للصوتيات والمستندات والفيديوهات
 - Word <-> PDF
+- تحويل الفيديو إلى صوت MP3
 - تحويل الصوت لعدة صيغ + تعديل البيانات (العنوان، الفنان، البوستر) باستخدام Mutagen
 - تحويل الصور (المجمعة والمفردة) إلى PDF أو Word
 مصمم للنشر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري
@@ -58,11 +59,12 @@ DOC_EXTENSIONS = {".doc", ".docx"}
 PDF_EXTENSION = ".pdf"
 EPUB_EXTENSION = ".epub"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".wma"}
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".3gp", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 # ----------------------------------------------------------------------
-# أدوات مساعدة
+# أدوات مساعدة للتشغيل
 # ----------------------------------------------------------------------
 
 async def run_cmd(*args: str) -> tuple[int, str, str]:
@@ -200,7 +202,7 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
 
 
 # ----------------------------------------------------------------------
-# منطق التحويلات الأخرى
+# منطق عمليات التحويل الفنية والوسائط
 # ----------------------------------------------------------------------
 
 async def convert_docx_to_pdf(input_path: Path, out_dir: Path) -> Path:
@@ -239,6 +241,22 @@ async def convert_audio(input_path: Path, out_dir: Path, target_format: str) -> 
     )
     if code != 0 or not output_path.exists():
         raise RuntimeError(f"فشل تحويل الصوت: {err[-500:]}")
+    return output_path
+
+
+async def convert_video_to_audio(input_path: Path, out_dir: Path) -> Path:
+    """
+    استخراج المسار الصوتي من ملف الفيديو وتحويله إلى صيغة MP3 نقية مباشرة.
+    """
+    output_path = out_dir / (input_path.stem + ".mp3")
+    code, out, err = await run_cmd(
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+        "-ar", "44100", "-ac", "2",
+        str(output_path)
+    )
+    if code != 0 or not output_path.exists():
+        raise RuntimeError(f"فشل استخراج الصوت من الفيديو: {err[-500:]}")
     return output_path
 
 
@@ -301,15 +319,16 @@ async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_na
 
 
 # ----------------------------------------------------------------------
-# اللوحات وأزرار التحكم
+# اللوحات وأزرار التحكم التفاعلية
 # ----------------------------------------------------------------------
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
-        [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
+        [InlineKeyboardButton("🎬 فيديو ➜ صوت MP3", callback_data="mode_video2audio")],
         [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
+        [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -343,6 +362,10 @@ def pdf_target_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("📝 Word", callback_data="pdftarget_word")]])
 
 
+def video_target_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎵 استخراج الصوت الآن", callback_data="vidtarget_extract")]])
+
+
 # ----------------------------------------------------------------------
 # التعامل مع الرسائل والـ Callbacks
 # ----------------------------------------------------------------------
@@ -350,8 +373,8 @@ def pdf_target_keyboard() -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     text = (
-        "👋 أهلًا بك في بوت تحويل الصيغ وتعديل الصوتيات الاحترافي!\n\n"
-        "💡 أرسل أي ملف مباشرة (صوت، مستند، صور) وسيتعامل معه البوت تلقائيًا وبذكاء."
+        "👋 أهلًا بك في بوت تحويل الصيغ المتقدم وتعديل وسائط الميديا المحترف!\n\n"
+        "💡 أرسل أي ملف مباشرة (فيديو، صوت، مستند، صور) وسيتعامل معه البوت تلقائيًا وبذكاء هندسي عالي."
     )
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
@@ -365,6 +388,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📄 أرسل الآن ملف Word (.doc أو .docx) لتحويله إلى PDF.")
     elif data == "mode_pdf2word":
         await query.edit_message_text("📄 أرسل الآن ملف PDF لتحويله إلى Word.")
+    elif data == "mode_video2audio":
+        await query.edit_message_text("🎬 أرسل الآن ملف الفيديو (.mp4, .mkv, إلخ) لاستخراج الصوت منه بصيغة MP3 نقي.")
     elif data == "mode_ebook":
         await query.edit_message_text("📚 أرسل الآن ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
     elif data == "mode_audio":
@@ -379,6 +404,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_image_conversion(update, context, data.split("_", 1)[1])
     elif data.startswith("pdftarget_"):
         await handle_pdf_target_conversion(update, context, data.split("_", 1)[1])
+    elif data == "vidtarget_extract":
+        await handle_video_extraction(update, context)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -396,6 +423,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ext in AUDIO_EXTENSIONS:
         await prompt_audio_format(update, context, document, filename)
+    elif ext in VIDEO_EXTENSIONS:
+        await prompt_video_target(update, context, document, filename)
     elif ext in IMAGE_EXTENSIONS:
         await queue_image_processing(update, context, document.file_id, document.file_unique_id, filename)
     elif ext in DOC_EXTENSIONS:
@@ -410,6 +439,12 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     audio = update.message.audio or update.message.voice
     filename = getattr(audio, "file_name", None) or "audio.mp3"
     await prompt_audio_format(update, context, audio, filename)
+
+
+async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    video = update.message.video or update.message.video_note
+    filename = getattr(video, "file_name", None) or "video.mp4"
+    await prompt_video_target(update, context, video, filename)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -439,7 +474,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
-# استكمال مسار الصوت والـ Metadata الصارم
+# استكمال مسار الصوت والفيديو والـ Metadata الصارم
 # ----------------------------------------------------------------------
 
 async def prompt_audio_format(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
@@ -458,7 +493,7 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتي.")
         return
 
-    await query.edit_message_text(f"⏳ جاري التحويل إلى {target_format.upper()} عبر FFmpeg...")
+    await query.edit_message_text(f"⏳ جاري التحويل الرقمي إلى {target_format.upper()} عبر FFmpeg...")
     try:
         local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
         result_path = await convert_audio(local_path, CONVERTED_DIR, target_format)
@@ -475,6 +510,43 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.exception("audio convert error")
         await query.edit_message_text(f"❌ حدث خطأ أثناء التحويل: {e}")
+
+
+async def prompt_video_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
+    context.user_data["pending_video"] = {
+        "file_id": tg_file.file_id,
+        "file_unique_id": tg_file.file_unique_id,
+        "filename": filename,
+    }
+    await update.message.reply_text("🎬 أكد رغبتك في استخراج مسار الصوت وتحويل الفيديو الحالي إلى ملف MP3 عالي النقاء:", reply_markup=video_target_keyboard())
+
+
+async def handle_video_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    pending = context.user_data.get("pending_video")
+    if not pending:
+        await query.edit_message_text("⚠️ لم يتم العثور على ملف فيديو معلق.")
+        return
+
+    await query.edit_message_text("⏳ جاري فصل وفك ترميز الصوت من حاوية الفيديو عبر FFmpeg...")
+    try:
+        local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
+        result_path = await convert_video_to_audio(local_path, CONVERTED_DIR)
+        
+        context.user_data["ready_audio_path"] = str(result_path)
+        context.user_data["audio_state"] = "WATING_TITLE"
+        
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✏️ تم استخراج المسار الصوتي بنجاح وبأعلى جودة الماستر المتاحة.\n\nالآن، أرسل **اسم الأغنية / العنوان الجديد**:",
+            reply_markup=metadata_skip_keyboard()
+        )
+        await query.delete_message()
+    except Exception as e:
+        logger.exception("video extract error")
+        await query.edit_message_text(f"❌ حدث خطأ أثناء معالجة حاوية الفيديو: {e}")
+    finally:
+        context.user_data.pop("pending_video", None)
 
 
 async def handle_metadata_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,12 +606,12 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
         )
 
     # تنظيف متغيرات الجلسة الصوتية الحالية
-    for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path", "pending_audio"]:
+    for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path", "pending_audio", "pending_video"]:
         context.user_data.pop(key, None)
 
 
 # ----------------------------------------------------------------------
-# بقية العمليات والوظائف الأساسية للبوت
+# بقية العمليات والوظائف الأساسية للبوت (الصور والمستندات)
 # ----------------------------------------------------------------------
 
 async def queue_image_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, file_unique_id: str, filename: str):
@@ -655,7 +727,7 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
-# دالة بدء التشغيل الأساسية
+# دالة بدء التشغيل الأساسية للبوت
 # ----------------------------------------------------------------------
 
 def main():
@@ -667,11 +739,12 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_message))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
-    logger.info("🚀 البوت انطلق رسميًا مع معالجة معيارية للـ Metadata عبر Mutagen...")
+    logger.info("🚀 البوت انطلق رسميًا مع دعم تحويل الفيديو الفوري عبر FFmpeg وتعديل الأغلفة...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
 
 
