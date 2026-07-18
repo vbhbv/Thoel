@@ -386,23 +386,37 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
 
 
 # ----------------------------------------------------------------------
-# كيبورد اللوحات والقوائم التفاعلية للمخدمين (تم التعديل بطلبك)
+# كيبورد اللوحات والقوائم التفاعلية للمخدمين (هيكلية الأزرار الذكية الجديدة)
 # ----------------------------------------------------------------------
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    # الواجهة الرئيسية تحتوي على زرين رئيسيين فقط
     buttons = [
-        # القسم الأول للمستندات والملفات
-        [InlineKeyboardButton("📂 --- قسم أدوات تعديل الملفات ---", callback_data="ignore_section")],
+        [InlineKeyboardButton("📂 أدوات تعديل الملفات", callback_data="sub_files")],
+        [InlineKeyboardButton("🎵 أدوات تعديل الصوتيات", callback_data="sub_audio")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def files_submenu_keyboard() -> InlineKeyboardMarkup:
+    # القائمة الفرعية الخاصة بالملفات والمستندات
+    buttons = [
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
         [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
         [InlineKeyboardButton("🔒 تشفير حماية الـ PDF", callback_data="mode_encrypt_pdf")],
-        
-        # القسم الثاني للصوتيات والوسائط
-        [InlineKeyboardButton("🎵 --- قسم أدوات تعديل الصوتيات ---", callback_data="ignore_section")],
+        [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def audio_submenu_keyboard() -> InlineKeyboardMarkup:
+    # القائمة الفرعية الخاصة بالصوتيات والميديا
+    buttons = [
         [InlineKeyboardButton("🎬 فيديو ➜ صوت MP3", callback_data="mode_video2audio")],
-        [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")]
+        [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
+        [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -456,7 +470,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     text = (
         "👋 أهلًا بك في بوت تحويل الصيغ المتقدم وتعديل وسائط الميديا المحترف!\n\n"
-        "💡 أرسل أي ملف مباشرة (فيديو، صوت، مستند، صور) وسيتعامل معه البوت تلقائيًا وبذكاء هندسي عالي."
+        "💡 اختر القسم المطلوب من الأزرار أدناه للبدء:"
     )
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
@@ -469,12 +483,19 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🚫 حسابك محظور.", show_alert=True)
         return
 
-    if query.data == "ignore_section":
-        await query.answer("💡 هذا عنوان للقسم فقط، اختر أحد الأزرار بالأسفل.", show_alert=False)
-        return
-
     await query.answer()
     data = query.data
+
+    # التنقل بين القوائم الفرعية والرئيسية
+    if data == "sub_files":
+        await query.edit_message_text("📂 **قسم أدوات تعديل الملفات:**\nاختر الأداة المطلوبة:", reply_markup=files_submenu_keyboard(), parse_mode="Markdown")
+        return
+    elif data == "sub_audio":
+        await query.edit_message_text("🎵 **قسم أدوات تعديل الصوتيات:**\nاختر الأداة المطلوبة:", reply_markup=audio_submenu_keyboard(), parse_mode="Markdown")
+        return
+    elif data == "back_to_main":
+        await query.edit_message_text("👋 اختر القسم المطلوب من الأزرار أدناه للبدء:", reply_markup=main_menu_keyboard())
+        return
 
     if data.startswith("admin_"):
         if not is_admin(user_id): return
