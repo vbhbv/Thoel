@@ -4,6 +4,7 @@
 - تحويل الفيديو إلى صوت MP3
 - تحويل الصوت لعدة صيغ + تعديل البيانات (العنوان، الفنان، البوستر) باستخدام Mutagen
 - تحويل الصور (المجمعة والمفردة) إلى PDF أو Word
+- حماية ملفات PDF وتشفيرها بكلمة سر باستخدام pypdf
 مصمم للنشر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري
 """
 
@@ -318,6 +319,22 @@ async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_na
     return output_path
 
 
+def encrypt_pdf_file(input_path: Path, output_path: Path, password: str):
+    """
+    تشفير ملف الـ PDF وحمايته بكلمة سر باستخدام حزمة pypdf.
+    """
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(str(input_path))
+    writer = PdfWriter()
+
+    for page in reader.pages:
+        writer.add_page(page)
+
+    writer.encrypt(password)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+
 # ----------------------------------------------------------------------
 # اللوحات وأزرار التحكم التفاعلية
 # ----------------------------------------------------------------------
@@ -330,6 +347,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
         [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
+        [InlineKeyboardButton("🔒 تشفير حماية الـ PDF", callback_data="mode_encrypt_pdf")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -359,7 +377,10 @@ def image_format_keyboard() -> InlineKeyboardMarkup:
 
 
 def pdf_target_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📝 Word", callback_data="pdftarget_word")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 تحويل إلى Word", callback_data="pdftarget_word")],
+        [InlineKeyboardButton("🔒 تشفير الملف بكلمة سر", callback_data="pdftarget_encrypt")]
+    ])
 
 
 def video_target_keyboard() -> InlineKeyboardMarkup:
@@ -396,6 +417,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🎵 أرسل الآن الملف الصوتي المراد تعديله أو تحويل صيغته.")
     elif data == "mode_image":
         await query.edit_message_text("🖼️ أرسل الآن الصورة أو مجموعة الصور المراد تجميعها.")
+    elif data == "mode_encrypt_pdf":
+        await query.edit_message_text("🔒 أرسل الآن ملف PDF لحمايته وتشفيره بكلمة مرور.")
     elif data.startswith("audiofmt_"):
         await handle_audio_conversion(update, context, data.split("_", 1)[1])
     elif data == "meta_skip":
@@ -458,10 +481,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("audio_state")
-    if not state:
+    pdf_state = context.user_data.get("pdf_state")
+    text = update.message.text.strip()
+
+    if pdf_state == "WAITING_PASSWORD":
+        await process_pdf_encryption(update, context, text)
         return
 
-    text = update.message.text.strip()
+    if not state:
+        return
 
     if state == "WATING_TITLE":
         context.user_data["meta_title"] = text
@@ -490,7 +518,7 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     pending = context.user_data.get("pending_audio")
     if not pending:
-        await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتي.")
+        await query.edit_message_text("⚠️ لم يتم العثور على ملف صوتی.")
         return
 
     await query.edit_message_text(f"⏳ جاري التحويل الرقمي إلى {target_format.upper()} عبر FFmpeg...")
@@ -677,24 +705,65 @@ async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def prompt_pdf_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     context.user_data["pending_pdf"] = {"file_id": tg_file.file_id, "file_unique_id": tg_file.file_unique_id, "filename": filename}
-    await update.message.reply_text("📄 أكد رغبتك في تحويل مستند الـ PDF الحالي إلى صيغة Word:", reply_markup=pdf_target_keyboard())
+    await update.message.reply_text("📄 اختر العملية المطلوبة لمستند الـ PDF الحالي:", reply_markup=pdf_target_keyboard())
 
 
 async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE, target_format: str):
     query = update.callback_query
     pending = context.user_data.get("pending_pdf")
     if not pending: return
-    await query.edit_message_text("⏳ جاري هندسة وتفكيك ملف الـ PDF إلى مستند Word...")
+
+    if target_format == "word":
+        await query.edit_message_text("⏳ جاري هندسة وتفكيك ملف الـ PDF إلى مستند Word...")
+        try:
+            lp = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
+            res = await convert_pdf_to_docx(lp, CONVERTED_DIR)
+            with open(res, "rb") as f:
+                await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=res.name)
+            await query.delete_message()
+            context.user_data.pop("pending_pdf", None)
+        except Exception as e:
+            await query.edit_message_text(f"❌ خطأ: {e}")
+            context.user_data.pop("pending_pdf", None)
+            
+    elif target_format == "encrypt":
+        context.user_data["pdf_state"] = "WAITING_PASSWORD"
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="🔒 ممتاز، أرسل الآن **كلمة السر** التي ترغب في تشفير وحماية ملف الـ PDF بها:"
+        )
+        await query.delete_message()
+
+
+async def process_pdf_encryption(update: Update, context: ContextTypes.DEFAULT_TYPE, password: str):
+    pending = context.user_data.get("pending_pdf")
+    if not pending:
+        await update.message.reply_text("⚠️ لم يتم العثور على مستند معلق لتشفيره.")
+        context.user_data.pop("pdf_state", None)
+        return
+
+    msg = await update.message.reply_text("⏳ جاري تحميل وتشفير مستند الـ PDF بشكل آمن...")
     try:
         lp = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
-        res = await convert_pdf_to_docx(lp, CONVERTED_DIR)
-        with open(res, "rb") as f:
-            await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=res.name)
-        await query.delete_message()
+        secured_name = f"protected_{Path(pending['filename']).stem}.pdf"
+        output_path = CONVERTED_DIR / secured_name
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, encrypt_pdf_file, lp, output_path, password)
+
+        with open(output_path, "rb") as f:
+            await update.message.reply_document(
+                document=f, 
+                filename=secured_name, 
+                caption="✅ تم تشفير ملف الـ PDF وحمايته بكلمة سر بنجاح!"
+            )
+        await msg.delete()
     except Exception as e:
-        await query.edit_message_text(f"❌ خطأ: {e}")
+        logger.exception("pdf encrypt error")
+        await msg.edit_text(f"❌ حدث خطأ أثناء تشفير الملف: {e}")
     finally:
         context.user_data.pop("pending_pdf", None)
+        context.user_data.pop("pdf_state", None)
 
 
 async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
