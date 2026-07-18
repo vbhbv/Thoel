@@ -1,6 +1,6 @@
 """
 بوت تليجرام متقدم لتحويل الصيغ، تعديل الـ Metadata للوسائط، وحماية ملفات PDF.
-تمت إضافة ميزات: ضغط الـ PDF، قص الصوت (Trim)، وتحويل النص إلى صوت (TTS).
+تمت إضافة ميزات: ضغط الـ PDF بشريط تقدم حقيقي، قص الصوت (Trim)، وتحويل النص إلى صوت (TTS).
 مدمج بالكامل مع قاعدة بيانات PostgreSQL ونظام لوحة تحكم الآدمن التفاعلية (Inline Panel).
 مصمم للنشر المستقر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري.
 """
@@ -343,16 +343,57 @@ def encrypt_pdf_file(input_path: Path, output_path: Path, password: str):
         writer.write(f)
 
 
-def compress_pdf_file(input_path: Path, output_path: Path):
-    """الميزة الثانية: ضغط ملف PDF لتقليل الحجم بشكل كبير"""
+def make_progress_bar(percent: int) -> str:
+    """توليد شريط تقدم رسومي يعتمد على النسبة المئوية الممررة"""
+    total_blocks = 10
+    filled_blocks = int(percent / 10)
+    empty_blocks = total_blocks - filled_blocks
+    bar = "█" * filled_blocks + "░" * empty_blocks
+    return f"{bar} {percent}%"
+
+
+async def compress_pdf_file_async(input_path: Path, output_path: Path, update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg):
+    """الميزة الثانية المحدثة: ضغط ملف PDF لتقليل الحجم بشكل كبير مع تفعيل شريط تقدم حقيقي آمن"""
     from pypdf import PdfReader, PdfWriter
+    
     reader = PdfReader(str(input_path))
     writer = PdfWriter()
-    for page in reader.pages:
-        page.compress_content_streams()  # ضغط المحتوى النصي والجداول
+    total_pages = len(reader.pages)
+    
+    last_update_time = time.time()
+    
+    for idx, page in enumerate(reader.pages, start=1):
+        try:
+            # ضغط محتوى الصفحة الداخلي
+            page.compress_content_streams()
+        except Exception as page_err:
+            # استثناء وحماية كاملة ضد انهيار البنية الداخلية للصفحات المتضررة
+            logger.warning(f"تم تخطي ضغط تيارات الصفحة {idx} لتجنب الانهيار: {page_err}")
+            
         writer.add_page(page)
-    with open(output_path, "wb") as f:
-        writer.write(f)
+        
+        # تحديث شريط التقدم التفاعلي كل صفحة (بشرط مرور ثانية على الأقل لتفادي حظر التليجرام Flood)
+        percent = int((idx / total_pages) * 100)
+        current_time = time.time()
+        if current_time - last_update_time >= 1.5 or idx == total_pages:
+            p_bar = make_progress_bar(percent)
+            try:
+                await status_msg.edit_text(
+                    f"⏳ **جاري معالجة وضغط صفحات الـ PDF...**\n\n"
+                    f"📄 الصفحة: `{idx}` من `{total_pages}`\n"
+                    f"`{p_bar}`",
+                    parse_mode="Markdown"
+                )
+                last_update_time = current_time
+            except Exception:
+                pass
+                
+    # حفظ وتخزين الملف النهائي على السيرفر سحابياً
+    def _write_file():
+        with open(output_path, "wb") as f:
+            writer.write(f)
+            
+    await asyncio.get_running_loop().run_in_executor(None, _write_file)
 
 
 async def trim_audio_file(input_path: Path, output_path: Path, start_time: str, end_time: str):
@@ -559,17 +600,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_user_banned(user_id): return
     mode = context.user_data.get("current_mode")
 
-    # معالجة ضغط PDF (الميزة الثانية)
+    # معالجة ضغط PDF (الميزة الثانية المحمية والمزودة بشريط تقدم حقيقي)
     if mode == "mode_compress_pdf" and update.message.document.file_name.lower().endswith('.pdf'):
-        msg = await update.message.reply_text("⏳ جاري ضغط ملف الـ PDF وتحسين المساحة...")
+        msg = await update.message.reply_text("⏳ جاري تهيئة وتحميل ملف الـ PDF لبدء الضغط الحركي...")
         doc = update.message.document
-        lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
-        out_p = CONVERTED_DIR / f"compressed_{doc.file_name}"
-        await asyncio.get_running_loop().run_in_executor(None, compress_pdf_file, lp, out_p)
-        await log_action("compress_pdf")
-        with open(out_p, "rb") as f:
-            await update.message.reply_document(document=f, filename=out_p.name, caption="✅ تم ضغط الملف وتقليل الحجم بنجاح!")
-        await msg.delete()
+        
+        try:
+            lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+            out_p = CONVERTED_DIR / f"compressed_{doc.file_name}"
+            
+            # استدعاء دالة المعالجة المحدثة
+            await compress_pdf_file_async(lp, out_p, update, context, msg)
+            
+            await log_action("compress_pdf")
+            with open(out_p, "rb") as f:
+                await update.message.reply_document(document=f, filename=out_p.name, caption="✅ تم ضغط الملف وتقليل الحجم بنجاح!")
+        except Exception as e:
+            logger.error(f"فشل ضغط ملف PDF بالكامل: {e}")
+            await update.message.reply_text(f"❌ تعذر ضغط هذا الملف بالكامل بسبب قيود هيكلية لبنيته الداخلية.")
+        finally:
+            await msg.delete()
         return
 
     # معالجة قص الصوت في حال أرسل كملف وثيقة (الميزة الثالثة)
