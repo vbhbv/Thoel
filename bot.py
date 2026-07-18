@@ -1,11 +1,7 @@
 """
-بوت تليجرام لتحويل الصيغ وتعديل الـ Metadata للصوتيات والمستندات والفيديوهات
-- Word <-> PDF
-- تحويل الفيديو إلى صوت MP3
-- تحويل الصوت لعدة صيغ + تعديل البيانات (العنوان، الفنان، البوستر) باستخدام Mutagen
-- تحويل الصور (المجمعة والمفردة) إلى PDF أو Word
-- حماية ملفات PDF وتشفيرها بكلمة سر باستخدام pypdf
-مصمم للنشر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري
+بوت تليجرام متقدم لتحويل الصيغ، تعديل الـ Metadata للوسائط، وحماية ملفات PDF.
+مدمج بالكامل مع قاعدة بيانات PostgreSQL ونظام لوحة تحكم الآدمن التفاعلية (Inline Panel).
+مصمم للنشر المستقر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري.
 """
 
 import os
@@ -13,7 +9,9 @@ import time
 import logging
 import asyncio
 from pathlib import Path
+from datetime import datetime
 
+import asyncpg  # مكتبة التعامل مع PostgreSQL بكفاءة وسرعة عالية
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -32,7 +30,7 @@ from pdf_epub_converter import (
 )
 
 # ----------------------------------------------------------------------
-# الإعدادات العامة
+# الإعدادات العامة ومتغيرات البيئة
 # ----------------------------------------------------------------------
 
 logging.basicConfig(
@@ -44,6 +42,13 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("يجب ضبط متغير البيئة BOT_TOKEN")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("يجب ضبط متغير البيئة DATABASE_URL المربوط بقاعدة PostgreSQL")
+
+# جلب معرفات الأدمن كقائمة أرقام
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "0").split(",") if x.strip()]
 
 BASE_DIR = Path(__file__).parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
@@ -65,7 +70,85 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 # ----------------------------------------------------------------------
-# أدوات مساعدة للتشغيل
+# منطق معالجة وقاعدة بيانات PostgreSQL
+# ----------------------------------------------------------------------
+
+def fix_database_url(url: str) -> str:
+    """معالجة الرابط ليناسب مكتبة asyncpg الحديثة"""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+async def init_db():
+    """تهيئة الجداول الأساسية في PostgreSQL عند إقلاع البوت"""
+    url = fix_database_url(DATABASE_URL)
+    try:
+        conn = await asyncpg.connect(url)
+        # جدول المستخدمين
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_banned BOOLEAN DEFAULT FALSE
+            );
+        """)
+        # جدول العمليات والإحصائيات
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS stats_log (
+                id SERIAL PRIMARY KEY,
+                action_type TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.close()
+        logger.info("✅ تم الاتصال بقاعدة البيانات PostgreSQL وتهيئة الجداول بنجاح.")
+    except Exception as e:
+        logger.error(f"❌ فشل تهيئة قاعدة البيانات: {e}")
+
+
+async def register_user(user_id: int, username: str):
+    """تسجيل المستخدم تلقائيًا أو تحديث بياناته عند التفاعل مع البوت"""
+    try:
+        conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, username) 
+            VALUES ($1, $2) 
+            ON CONFLICT (user_id) DO UPDATE SET username = $2;
+            """,
+            user_id, username
+        )
+        await conn.close()
+    except Exception as e:
+        logger.error(f"خطأ أثناء تسجيل المستخدم {user_id}: {e}")
+
+
+async def is_user_banned(user_id: int) -> bool:
+    """التحقق مما إذا كان المستخدم محظورًا من الإدارة"""
+    try:
+        conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+        row = await conn.fetchrow("SELECT is_banned FROM users WHERE user_id = $1;", user_id)
+        await conn.close()
+        return row["is_banned"] if row else False
+    except Exception as e:
+        logger.error(f"خطأ أثناء فحص حظر المستخدم: {e}")
+        return False
+
+
+async def log_action(action_type: str):
+    """تسجيل العمليات الناجحة في قاعدة البيانات لحساب الإحصائيات بدقة"""
+    try:
+        conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+        await conn.execute("INSERT INTO stats_log (action_type) VALUES ($1);", action_type)
+        await conn.close()
+    except Exception as e:
+        logger.error(f"خطأ أثناء تسجيل العملية {action_type}: {e}")
+
+
+# ----------------------------------------------------------------------
+# أدوات مساعدة للتشغيل والتحويل الفني والوسائط
 # ----------------------------------------------------------------------
 
 async def run_cmd(*args: str) -> tuple[int, str, str]:
@@ -86,27 +169,18 @@ async def download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: st
     return local_path
 
 
-# ----------------------------------------------------------------------
-# منطق الـ Metadata المتقدم والأغلفة النظيفة باستخدام Mutagen & Pillow
-# ----------------------------------------------------------------------
-
 def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None, album_art_path: Path = None):
-    """
-    تعديل الـ tags وحقن الغلاف بدقة لكل صيغة صوتية بعد معالجة الصورة وتنظيف الـ tags القديمة.
-    """
     from PIL import Image
     from io import BytesIO
     
     ext = audio_path.suffix.lower()
     image_bytes = None
     
-    # توحيد صيغة الصورة إلى JPEG قياسي مهما كان المصدر (PNG, WebP، إلخ) لمنع المشاكل في المشغلات
     if album_art_path and album_art_path.exists():
         try:
             with Image.open(album_art_path) as img:
                 if img.mode in ("RGBA", "P", "LA") or img.format == "WEBP":
                     img = img.convert("RGB")
-                
                 buffer = BytesIO()
                 img.save(buffer, format="JPEG", quality=95)
                 image_bytes = buffer.getvalue()
@@ -114,97 +188,63 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
             logger.error(f"خطأ أثناء معالجة الصورة وتحويلها إلى JPEG: {img_err}")
 
     try:
-        # 1. معالجة ملفات MP3
         if ext == ".mp3":
             from mutagen.id3 import ID3, TIT2, TPE1, APIC, ID3NoHeaderError
             try:
                 audio = ID3(str(audio_path))
             except ID3NoHeaderError:
                 audio = ID3()
-            
-            if title:
-                audio.add(TIT2(encoding=3, text=title))
-            if artist:
-                audio.add(TPE1(encoding=3, text=artist))
-            
+            if title: audio.add(TIT2(encoding=3, text=title))
+            if artist: audio.add(TPE1(encoding=3, text=artist))
             if image_bytes:
-                # حذف ألبومات الـ APIC القديمة لتجنب تراكم أو تضارب الصور المكررة
                 audio.delall("APIC")
-                audio.add(APIC(
-                    encoding=3,
-                    mime="image/jpeg",
-                    type=3,  # Front Cover
-                    desc="Cover",
-                    data=image_bytes
-                ))
+                audio.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=image_bytes))
             audio.save(str(audio_path))
 
-        # 2. معالجة ملفات M4A / AAC
         elif ext in [".m4a", ".aac"]:
             from mutagen.mp4 import MP4, MP4Cover
             try:
                 audio = MP4(str(audio_path))
-                if title:
-                    audio["\xa9nam"] = title
-                if artist:
-                    audio["\xa9ART"] = artist
-                if image_bytes:
-                    audio["covr"] = [MP4Cover(image_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+                if title: audio["\xa9nam"] = title
+                if artist: audio["\xa9ART"] = artist
+                if image_bytes: audio["covr"] = [MP4Cover(image_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
                 audio.save()
             except Exception as mp4_err:
                 logger.error(f"فشلت معالجة حاوية MP4/M4A: {mp4_err}")
 
-        # 3. معالجة ملفات FLAC
         elif ext == ".flac":
             from mutagen.flac import FLAC, Picture
             audio = FLAC(str(audio_path))
-            if title:
-                audio["title"] = title
-            if artist:
-                audio["artist"] = artist
+            if title: audio["title"] = title
+            if artist: audio["artist"] = artist
             if image_bytes:
                 pic = Picture()
                 pic.data = image_bytes
                 pic.type = 3
                 pic.mime = "image/jpeg"
                 pic.description = "Cover"
-                audio.clear_pictures()  # تنظيف كلي للصور السابقة
+                audio.clear_pictures()
                 audio.add_picture(pic)
             audio.save()
 
-        # 4. معالجة ملفات OGG / OPUS
         elif ext in [".ogg", ".opus"]:
             from mutagen.oggvorbis import OggVorbis
             import base64
             from mutagen.flac import Picture
-            
             audio = OggVorbis(str(audio_path))
-            if title:
-                audio["title"] = title
-            if artist:
-                audio["artist"] = artist
+            if title: audio["title"] = title
+            if artist: audio["artist"] = artist
             if image_bytes:
                 pic = Picture()
                 pic.data = image_bytes
                 pic.type = 3
                 pic.mime = "image/jpeg"
                 pic.description = "Cover"
-                # تنظيف وحقن الصورة مشفرة Base64 ككتلة بيانات متوافقة مع قواعد Vorbis
                 audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
             audio.save()
-
-        # 5. ملفات WAV
-        elif ext == ".wav":
-            if title or artist:
-                logger.info("صيغة WAV لا تدعم الأغلفة بشكل قياسي، تم تخطي معالجة الغلاف.")
-
     except Exception as e:
-        logger.error(f"خطأ غير متوقع أثناء معالجة بيانات الصوت عبر Mutagen للصيغة {ext}: {e}")
+        logger.error(f"خطأ غير متوقع في Mutagen للصيغة {ext}: {e}")
 
-
-# ----------------------------------------------------------------------
-# منطق عمليات التحويل الفنية والوسائط
-# ----------------------------------------------------------------------
 
 async def convert_docx_to_pdf(input_path: Path, out_dir: Path) -> Path:
     code, out, err = await run_cmd(
@@ -219,15 +259,12 @@ async def convert_docx_to_pdf(input_path: Path, out_dir: Path) -> Path:
 
 async def convert_pdf_to_docx(input_path: Path, out_dir: Path) -> Path:
     output_path = out_dir / (input_path.stem + ".docx")
-
     def _convert():
         from pdf2docx import Converter
         cv = Converter(str(input_path))
         cv.convert(str(output_path))
         cv.close()
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _convert)
+    await asyncio.get_running_loop().run_in_executor(None, _convert)
     if not output_path.exists():
         raise RuntimeError("فشل تحويل PDF إلى Word")
     return output_path
@@ -246,9 +283,6 @@ async def convert_audio(input_path: Path, out_dir: Path, target_format: str) -> 
 
 
 async def convert_video_to_audio(input_path: Path, out_dir: Path) -> Path:
-    """
-    استخراج المسار الصوتي من ملف الفيديو وتحويله إلى صيغة MP3 نقية مباشرة.
-    """
     output_path = out_dir / (input_path.stem + ".mp3")
     code, out, err = await run_cmd(
         "ffmpeg", "-y", "-i", str(input_path),
@@ -263,11 +297,9 @@ async def convert_video_to_audio(input_path: Path, out_dir: Path) -> Path:
 
 async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_name: str) -> Path:
     output_path = out_dir / (base_name + ".pdf")
-
     def _convert():
         from PIL import Image
         import img2pdf
-
         processed_paths = []
         for path in input_paths:
             with Image.open(path) as img:
@@ -276,27 +308,20 @@ async def convert_images_to_pdf(input_paths: list[Path], out_dir: Path, base_nam
                 tmp_path = path.with_suffix(".conv.jpg")
                 img.save(tmp_path, "JPEG", quality=95)
                 processed_paths.append(str(tmp_path))
-
         pdf_bytes = img2pdf.convert(processed_paths)
         with open(output_path, "wb") as f:
             f.write(pdf_bytes)
-
-        for p in processed_paths:
-            Path(p).unlink(missing_ok=True)
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _convert)
+        for p in processed_paths: Path(p).unlink(missing_ok=True)
+    await asyncio.get_running_loop().run_in_executor(None, _convert)
     return output_path
 
 
 async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_name: str) -> Path:
     output_path = out_dir / (base_name + ".docx")
-
     def _convert():
         from docx import Document
         from docx.shared import Inches
         from PIL import Image
-
         doc = Document()
         for path in input_paths:
             with Image.open(path) as img:
@@ -307,36 +332,26 @@ async def convert_images_to_docx(input_paths: list[Path], out_dir: Path, base_na
                     source = fixed_path
                 else:
                     source = path
-
             doc.add_picture(str(source), width=Inches(6))
-            if source != path:
-                source.unlink(missing_ok=True)
-
+            if source != path: source.unlink(missing_ok=True)
         doc.save(str(output_path))
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _convert)
+    await asyncio.get_running_loop().run_in_executor(None, _convert)
     return output_path
 
 
 def encrypt_pdf_file(input_path: Path, output_path: Path, password: str):
-    """
-    تشفير ملف الـ PDF وحمايته بكلمة سر باستخدام حزمة pypdf.
-    """
     from pypdf import PdfReader, PdfWriter
     reader = PdfReader(str(input_path))
     writer = PdfWriter()
-
     for page in reader.pages:
         writer.add_page(page)
-
     writer.encrypt(password)
     with open(output_path, "wb") as f:
         writer.write(f)
 
 
 # ----------------------------------------------------------------------
-# اللوحات وأزرار التحكم التفاعلية
+# كيبورد اللوحات والقوائم التفاعلية للمستخدمين
 # ----------------------------------------------------------------------
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -353,15 +368,13 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def audio_format_keyboard() -> InlineKeyboardMarkup:
-    row = []
-    rows = []
+    row, rows = [], []
     for fmt in AUDIO_FORMATS:
         row.append(InlineKeyboardButton(fmt.upper(), callback_data=f"audiofmt_{fmt}"))
         if len(row) == 3:
             rows.append(row)
             row = []
-    if row:
-        rows.append(row)
+    if row: rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
@@ -388,10 +401,47 @@ def video_target_keyboard() -> InlineKeyboardMarkup:
 
 
 # ----------------------------------------------------------------------
-# التعامل مع الرسائل والـ Callbacks
+# لوحة تحكم وإدارة الآدمن (Inline Admin Panel)
+# ----------------------------------------------------------------------
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("📊 إحصائيات البوت", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 إذاعة جماعية (Broadcast)", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🚫 حظر مستخدم", callback_data="admin_ban"),
+         InlineKeyboardButton("🟢 إلغاء حظر", callback_data="admin_unban")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر فتح لوحة التحكم للآدمنز فقط /admin"""
+    if not is_admin(update.effective_user.id):
+        return  # حماية صامتة للبوت
+    
+    await update.message.reply_text(
+        "⚙️ **لوحة تحكم الإدارة وقاعدة البيانات الاحترافية**\nاختر من الأزرار الإجراء المطلوب:",
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+# ----------------------------------------------------------------------
+# معالجة الرسائل والـ Callbacks الشاملة
 # ----------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await register_user(user.id, user.username) # تسجيل المستخدم تلقائيًا
+    
+    if await is_user_banned(user.id): # التحقق الفوري من الحظر
+        await update.message.reply_text("🚫 نعتذر، حسابك محظور حاليًا من استخدام خدمات البوت.")
+        return
+
     context.user_data.clear()
     text = (
         "👋 أهلًا بك في بوت تحويل الصيغ المتقدم وتعديل وسائط الميديا المحترف!\n\n"
@@ -402,15 +452,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
+    
+    # فحص الحظر العام
+    if await is_user_banned(user_id):
+        await query.answer("🚫 حسابك محظور.", show_alert=True)
+        return
+
     await query.answer()
     data = query.data
 
+    # --- معالجة كول باكس الآدمن أولاً ---
+    if data.startswith("admin_"):
+        if not is_admin(user_id): return
+        
+        if data == "admin_stats":
+            await query.edit_message_text("⏳ جاري جلب الإحصائيات الحية من PostgreSQL...")
+            try:
+                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+                total_users = await conn.fetchval("SELECT COUNT(*) FROM users;")
+                banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE;")
+                total_actions = await conn.fetchval("SELECT COUNT(*) FROM stats_log;")
+                await conn.close()
+
+                stats_text = (
+                    "📊 **إحصائيات النظام الحالية:**\n\n"
+                    f"👥 إجمالي المستخدمين المسجلين: `{total_users}`\n"
+                    f"🚫 عدد المستخدمين المحظورين: `{banned_users}`\n"
+                    f"⚙️ إجمالي العمليات الناجحة: `{total_actions}`\n"
+                )
+                await query.edit_message_text(stats_text, reply_markup=admin_keyboard(), parse_mode="Markdown")
+            except Exception as e:
+                await query.edit_message_text(f"❌ خطأ الإحصائيات: {e}", reply_markup=admin_keyboard())
+        
+        elif data == "admin_broadcast":
+            context.user_data["admin_state"] = "WAITING_BROADCAST_MSG"
+            await query.edit_message_text("📢 أرسل الآن الرسالة أو الملف الذي تود إذاعته جماعيًا لجميع المستخدمين:")
+        
+        elif data == "admin_ban":
+            context.user_data["admin_state"] = "WAITING_BAN_ID"
+            await query.edit_message_text("🚫 أرسل الـ `User ID` الخاص بالمستخدم المراد حظره:")
+        
+        elif data == "admin_unban":
+            context.user_data["admin_state"] = "WAITING_UNBAN_ID"
+            await query.edit_message_text("🟢 أرسل الـ `User ID` الخاص بالمستخدم لإلغاء الحظر عنه:")
+        return
+
+    # --- معالجة كول باكس المستخدمين العادية ---
     if data == "mode_word2pdf":
         await query.edit_message_text("📄 أرسل الآن ملف Word (.doc أو .docx) لتحويله إلى PDF.")
     elif data == "mode_pdf2word":
         await query.edit_message_text("📄 أرسل الآن ملف PDF لتحويله إلى Word.")
     elif data == "mode_video2audio":
-        await query.edit_message_text("🎬 أرسل الآن ملف الفيديو (.mp4, .mkv, إلخ) لاستخراج الصوت منه بصيغة MP3 نقي.")
+        await query.edit_message_text("🎬 أرسل الآن ملف الفيديو لاستخراج الصوت منه بصيغة MP3 نقي.")
     elif data == "mode_ebook":
         await query.edit_message_text("📚 أرسل الآن ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
     elif data == "mode_audio":
@@ -432,6 +526,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await register_user(user.id, user.username)
+    if await is_user_banned(user.id): return
+
     if context.user_data.get("audio_state") == "WATING_ART":
         await handle_photo_as_art(update, context, update.message.document)
         return
@@ -459,18 +557,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await register_user(user.id, user.username)
+    if await is_user_banned(user.id): return
+
     audio = update.message.audio or update.message.voice
     filename = getattr(audio, "file_name", None) or "audio.mp3"
     await prompt_audio_format(update, context, audio, filename)
 
 
 async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await register_user(user.id, user.username)
+    if await is_user_banned(user.id): return
+
     video = update.message.video or update.message.video_note
     filename = getattr(video, "file_name", None) or "video.mp4"
     await prompt_video_target(update, context, video, filename)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await register_user(user.id, user.username)
+    if await is_user_banned(user.id): return
+
     if context.user_data.get("audio_state") == "WATING_ART":
         await handle_photo_as_art(update, context, update.message.photo[-1])
         return
@@ -480,16 +590,77 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = update.effective_user
+    await register_user(user.id, user.username)
+    if await is_user_banned(user_id): return
+
+    admin_state = context.user_data.get("admin_state")
     state = context.user_data.get("audio_state")
     pdf_state = context.user_data.get("pdf_state")
     text = update.message.text.strip()
 
+    # --- معالجة مدخلات الآدمن للنص أولاً ---
+    if admin_state and is_admin(user_id):
+        if admin_state == "WAITING_BROADCAST_MSG":
+            context.user_data.pop("admin_state", None)
+            status_msg = await update.message.reply_text("⏳ جاري بدء الإذاعة الجماعية لكافة المستخدمين النشطين...")
+            try:
+                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+                rows = await conn.fetch("SELECT user_id FROM users WHERE is_banned = FALSE;")
+                await conn.close()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ فشل جلب المشتركين من القاعدة: {e}")
+                return
+
+            success, failed = 0, 0
+            for row in rows:
+                target_id = row["user_id"]
+                if target_id == user_id: continue
+                try:
+                    await context.bot.copy_message(chat_id=target_id, from_chat_id=update.message.chat_id, message_id=update.message.message_id)
+                    success += 1
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    failed += 1
+
+            await status_msg.edit_text(f"📢 **اكتملت الإذاعة الجماعية بنجاح!**\n\n✅ تم الإرسال إلى: `{success}`\n❌ فشل الإرسال إلى: `{failed}`", parse_mode="Markdown")
+            return
+
+        elif admin_state == "WAITING_BAN_ID":
+            context.user_data.pop("admin_state", None)
+            if not text.isdigit():
+                await update.message.reply_text("⚠️ المعرف يجب أن يكون رقمًا فقط.")
+                return
+            try:
+                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+                await conn.execute("UPDATE users SET is_banned = TRUE WHERE user_id = $1;", int(text))
+                await conn.close()
+                await update.message.reply_text(f"✅ تم حظر المستخدم `{text}` بنجاح ومنعه من البوت.", parse_mode="Markdown")
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطأ أثناء الحظر: {e}")
+            return
+
+        elif admin_state == "WAITING_UNBAN_ID":
+            context.user_data.pop("admin_state", None)
+            if not text.isdigit():
+                await update.message.reply_text("⚠️ المعرف يجب أن يكون رقمًا فقط.")
+                return
+            try:
+                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+                await conn.execute("UPDATE users SET is_banned = FALSE WHERE user_id = $1;", int(text))
+                await conn.close()
+                await update.message.reply_text(f"🟢 تم إلغاء حظر المستخدم `{text}` بنجاح وعاد للوضع النشط.", parse_mode="Markdown")
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطأ إلغاء الحظر: {e}")
+            return
+
+    # --- معالجة مدخلات النصوص للمستخدمين العاديين ---
     if pdf_state == "WAITING_PASSWORD":
         await process_pdf_encryption(update, context, text)
         return
 
-    if not state:
-        return
+    if not state: return
 
     if state == "WATING_TITLE":
         context.user_data["meta_title"] = text
@@ -526,6 +697,7 @@ async def handle_audio_conversion(update: Update, context: ContextTypes.DEFAULT_
         local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
         result_path = await convert_audio(local_path, CONVERTED_DIR, target_format)
         
+        await log_action(f"audio_convert_{target_format}") # تسجيل العملية في قاعدة البيانات
         context.user_data["ready_audio_path"] = str(result_path)
         context.user_data["audio_state"] = "WATING_TITLE"
         
@@ -561,6 +733,7 @@ async def handle_video_extraction(update: Update, context: ContextTypes.DEFAULT_
         local_path = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
         result_path = await convert_video_to_audio(local_path, CONVERTED_DIR)
         
+        await log_action("video_to_audio") # تسجيل العملية في قاعدة البيانات
         context.user_data["ready_audio_path"] = str(result_path)
         context.user_data["audio_state"] = "WATING_TITLE"
         
@@ -595,7 +768,6 @@ async def handle_metadata_skip(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_photo_as_art(update: Update, context: ContextTypes.DEFAULT_TYPE, photo_obj):
     chat_id = update.message.chat_id
     status_msg = await update.message.reply_text("⏳ جاري معالجة وحقن البيانات الفنية المتقدمة داخل الغلاف...")
-    
     try:
         filename = f"art_{photo_obj.file_unique_id}.jpg"
         art_path = await download_telegram_file(context, photo_obj.file_id, photo_obj.file_unique_id, filename)
@@ -619,11 +791,8 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
     art_path_str = context.user_data.get("meta_art_path")
     art_path = Path(art_path_str) if art_path_str else None
 
-    # تشغيل منطق التعديل المبني على Mutagen و Pillow في Thread منفصل لتفادي تجميد البوت
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, apply_audio_metadata, audio_path, title, artist, art_path)
+    await asyncio.get_running_loop().run_in_executor(None, apply_audio_metadata, audio_path, title, artist, art_path)
 
-    # إرسال الملف النهائي
     with open(audio_path, "rb") as f:
         await context.bot.send_audio(
             chat_id=chat_id,
@@ -633,7 +802,6 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
             caption="✅ تم تحديث الـ Tags وحقن الغلاف بنجاح عبر Mutagen!"
         )
 
-    # تنظيف متغيرات الجلسة الصوتية الحالية
     for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path", "pending_audio", "pending_video"]:
         context.user_data.pop(key, None)
 
@@ -682,6 +850,8 @@ async def handle_image_conversion(update: Update, context: ContextTypes.DEFAULT_
             res = await convert_images_to_pdf(local_paths, CONVERTED_DIR, base)
         else:
             res = await convert_images_to_docx(local_paths, CONVERTED_DIR, base)
+        
+        await log_action(f"image_to_{target_format}") # تسجيل في الـ Postgres
         with open(res, "rb") as f:
             await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=res.name)
         await query.delete_message()
@@ -696,6 +866,7 @@ async def process_word_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         lp = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
         res = await convert_docx_to_pdf(lp, CONVERTED_DIR)
+        await log_action("word_to_pdf") # تسجيل في الـ Postgres
         with open(res, "rb") as f:
             await update.message.reply_document(document=f, filename=res.name)
         await msg.delete()
@@ -718,6 +889,7 @@ async def handle_pdf_target_conversion(update: Update, context: ContextTypes.DEF
         try:
             lp = await download_telegram_file(context, pending["file_id"], pending["file_unique_id"], pending["filename"])
             res = await convert_pdf_to_docx(lp, CONVERTED_DIR)
+            await log_action("pdf_to_word") # تسجيل في الـ Postgres
             with open(res, "rb") as f:
                 await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=res.name)
             await query.delete_message()
@@ -748,15 +920,11 @@ async def process_pdf_encryption(update: Update, context: ContextTypes.DEFAULT_T
         secured_name = f"protected_{Path(pending['filename']).stem}.pdf"
         output_path = CONVERTED_DIR / secured_name
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, encrypt_pdf_file, lp, output_path, password)
+        await asyncio.get_running_loop().run_in_executor(None, encrypt_pdf_file, lp, output_path, password)
+        await log_action("pdf_encrypt") # تسجيل في الـ Postgres
 
         with open(output_path, "rb") as f:
-            await update.message.reply_document(
-                document=f, 
-                filename=secured_name, 
-                caption="✅ تم تشفير ملف الـ PDF وحمايته بكلمة سر بنجاح!"
-            )
+            await update.message.reply_document(document=f, filename=secured_name, caption="✅ تم تشفير ملف الـ PDF وحمايته بكلمة سر بنجاح!")
         await msg.delete()
     except Exception as e:
         logger.exception("pdf encrypt error")
@@ -774,6 +942,7 @@ async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         lp = await download_telegram_file(context, tg_file.file_id, tg_file.file_unique_id, filename)
         res = await convert_epub_to_pdf(lp, CONVERTED_DIR)
+        await log_action("epub_to_pdf") # تسجيل في الـ Postgres
         with open(res, "rb") as f:
             await update.message.reply_document(document=f, filename=res.name)
         await msg.delete()
@@ -796,14 +965,20 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------------------------------------------------------
-# دالة بدء التشغيل الأساسية للبوت
+# دالة بدء التشغيل الأساسية للبوت وإطلاق قاعدة البيانات
 # ----------------------------------------------------------------------
 
 def main():
+    # إنشاء حلقة الأحداث وتهيئة الجداول أولاً قبل ربط البوت
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init_db())
+
     request_config = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(request_config).build()
 
+    # الـ Handlers الخاصة بالآدمن والمستخدمين
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel_command)) # أمر الآدمن
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -813,7 +988,7 @@ def main():
 
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
-    logger.info("🚀 البوت انطلق رسميًا مع دعم تحويل الفيديو الفوري عبر FFmpeg وتعديل الأغلفة...")
+    logger.info("🚀 البوت انطلق رسميًا بدعم PostgreSQL ولوحة التحكم المتكاملة الحية...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
 
 
