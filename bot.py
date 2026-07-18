@@ -1,9 +1,7 @@
 """
 بوت تليجرام متقدم لتحويل الصيغ، تعديل الـ Metadata للوسائط، وحماية ملفات PDF.
-تمت إضافة ميزات: ضغط الـ PDF بشريط تقدم حقيقي، قص الصوت (Trim)، وتحويل النص إلى صوت (TTS).
-تحديث جديد: دمج ملفات PDF المتعددة، وتقسيم وقص نطاق معين من صفحات الـ PDF.
+تحديث جديد: دمج وقص الأصوات، تغيير سرعة وحجم الصوت، ونظام الاشتراك الإجباري بقناة التليجرام عبر لوحة الآدمن.
 مدمج بالكامل مع قاعدة بيانات PostgreSQL ونظام لوحة تحكم الآدمن التفاعلية (Inline Panel).
-مصمم للنشر المستقر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري.
 """
 
 import os
@@ -71,7 +69,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 # ----------------------------------------------------------------------
-# منطق معالجة وقاعدة بيانات PostgreSQL
+# منطق معالجة وقاعدة بيانات PostgreSQL (مُحدث لإضافة إعدادات الاشتراك)
 # ----------------------------------------------------------------------
 
 def fix_database_url(url: str) -> str:
@@ -97,6 +95,13 @@ async def init_db():
                 id SERIAL PRIMARY KEY,
                 action_type TEXT NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # جدول لتخزين يوزر القناة للاشتراك الإجباري ديناميكياً
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             );
         """)
         await conn.close()
@@ -139,6 +144,67 @@ async def log_action(action_type: str):
         await conn.close()
     except Exception as e:
         logger.error(f"خطأ أثناء تسجيل العملية {action_type}: {e}")
+
+
+async def get_setting(key: str) -> str:
+    try:
+        conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+        val = await conn.fetchval("SELECT value FROM settings WHERE key = $1;", key)
+        await conn.close()
+        return val
+    except Exception as e:
+        logger.error(f"خطأ جلب الإعدادات {key}: {e}")
+        return None
+
+
+async def set_setting(key: str, value: str):
+    try:
+        conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
+            key, value
+        )
+        await conn.close()
+    except Exception as e:
+        logger.error(f"خطأ حفظ الإعدادات {key}: {e}")
+
+
+# ----------------------------------------------------------------------
+# فحص الاشتراك الإجباري الاحترافي
+# ----------------------------------------------------------------------
+
+async def check_force_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يتحقق من اشتراك المستخدم بالقناة المحددة من لوحة التحكم، المدراء مستثنون تلقائياً"""
+    if user_id in ADMIN_IDS:
+        return True
+        
+    channel_username = await get_setting("force_channel")
+    if not channel_username:
+        return True  # ميزة الاشتراك معطلة لعدم تعيين يوزر
+        
+    # تنظيف وتنسيق المعرف ليكون ملائماً للفحص والتوجيه
+    clean_username = channel_username.replace("@", "").strip()
+    chat_id = f"@{clean_username}"
+    
+    try:
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            return True
+    except Exception as e:
+        logger.error(f"خطأ أثناء فحص الاشتراك الإجباري في {chat_id}: {e}")
+        # في حال عدم وجود البوت في القناة كآدمن سيمر الفحص حماية للبوت من التوقف
+        return True
+        
+    return False
+
+
+def get_sub_keyboard(channel_username: str) -> InlineKeyboardMarkup:
+    clean_username = channel_username.replace("@", "").strip()
+    buttons = [
+        [InlineKeyboardButton("📢 اشترك في القناة أولاً", url=f"https://t.me/{clean_username}")],
+        [InlineKeyboardButton("✅ تم الاشتراك (تفعيل)", callback_data="check_sub_again")]
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 # ----------------------------------------------------------------------
@@ -345,7 +411,6 @@ def encrypt_pdf_file(input_path: Path, output_path: Path, password: str):
 
 
 def make_progress_bar(percent: int) -> str:
-    """توليد شريط تقدم رسومي يعتمد على النسبة المئوية الممررة"""
     total_blocks = 10
     filled_blocks = int(percent / 10)
     empty_blocks = total_blocks - filled_blocks
@@ -354,7 +419,6 @@ def make_progress_bar(percent: int) -> str:
 
 
 async def compress_pdf_file_async(input_path: Path, output_path: Path, update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg):
-    """الميزة الثانية المحدثة: ضغط ملف PDF لتقليل الحجم بشكل كبير مع تفعيل شريط تقدم حقيقي آمن"""
     from pypdf import PdfReader, PdfWriter
     
     reader = PdfReader(str(input_path))
@@ -365,15 +429,12 @@ async def compress_pdf_file_async(input_path: Path, output_path: Path, update: U
     
     for idx, page in enumerate(reader.pages, start=1):
         try:
-            # ضغط محتوى الصفحة الداخلي
             page.compress_content_streams()
         except Exception as page_err:
-            # استثناء وحماية كاملة ضد انهيار البنية الداخلية للصفحات المتضررة
             logger.warning(f"تم تخطي ضغط تيارات الصفحة {idx} لتجنب الانهيار: {page_err}")
             
         writer.add_page(page)
         
-        # تحديث شريط التقدم التفاعلي كل صفحة (بشرط مرور ثانية على الأقل لتفادي حظر التليجرام Flood)
         percent = int((idx / total_pages) * 100)
         current_time = time.time()
         if current_time - last_update_time >= 1.5 or idx == total_pages:
@@ -389,7 +450,6 @@ async def compress_pdf_file_async(input_path: Path, output_path: Path, update: U
             except Exception:
                 pass
                 
-    # حفظ وتخزين الملف النهائي على السيرفر سحابياً
     def _write_file():
         with open(output_path, "wb") as f:
             writer.write(f)
@@ -398,13 +458,53 @@ async def compress_pdf_file_async(input_path: Path, output_path: Path, update: U
 
 
 async def trim_audio_file(input_path: Path, output_path: Path, start_time: str, end_time: str):
-    """الميزة الثالثة: قص مقطع صوتي باستخدام ffmpeg عبر التوقيت المرسل"""
     code, out, err = await run_cmd(
         "ffmpeg", "-y", "-ss", start_time, "-to", end_time, 
         "-i", str(input_path), "-acodec", "copy", str(output_path)
     )
     if code != 0 or not output_path.exists():
         raise RuntimeError(f"فشل قص الصوت، تأكد من صحة كتابة الوقت المتطابق: {err[-300:]}")
+
+
+# ----------------------------------------------------------------------
+# فلاتر ومعالجات الصوت المضافة حديثاً (سرعة، دمج، تحكّم بالصوت)
+# ----------------------------------------------------------------------
+
+async def change_audio_speed(input_path: Path, output_path: Path, speed: float):
+    """تغيير سرعة الصوت الفنية (atempo) دون تخريب الـ Pitch الخاص بالخامة الصوتية"""
+    code, out, err = await run_cmd(
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-filter:a", f"atempo={speed}",
+        "-vn", str(output_path)
+    )
+    if code != 0 or not output_path.exists():
+        raise RuntimeError(f"فشل تغيير سرعة الصوت: {err[-300:]}")
+
+
+async def merge_audio_files(input_paths: list[Path], output_path: Path):
+    """دمج ملفات صوتية متعددة بالتتالي في مسار واحد"""
+    inputs = []
+    for p in input_paths:
+        inputs.extend(["-i", str(p)])
+    filter_complex = f"concat=n={len(input_paths)}:v=0:a=1[a]"
+    code, out, err = await run_cmd(
+        "ffmpeg", "-y", *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[a]", str(output_path)
+    )
+    if code != 0 or not output_path.exists():
+        raise RuntimeError(f"فشل دمج الملفات الصوتية: {err[-300:]}")
+
+
+async def change_audio_volume(input_path: Path, output_path: Path, volume_db: float):
+    """تعديل حجم أو ديسيبل الصوت إيجاباً أو سلباً عبر الفلترة الهندسية لـ ffmpeg"""
+    code, out, err = await run_cmd(
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-filter:a", f"volume={volume_db}dB",
+        str(output_path)
+    )
+    if code != 0 or not output_path.exists():
+        raise RuntimeError(f"فشل تعديل مستوى الصوت: {err[-300:]}")
 
 
 async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
@@ -451,42 +551,32 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
 
 
 # ----------------------------------------------------------------------
-# آليات معالجة تقسيم ودمج الـ PDF المضافة حديثاً
+# آليات معالجة تقسيم ودمج الـ PDF
 # ----------------------------------------------------------------------
 
 async def split_pdf_pages(input_path: Path, output_path: Path, start_page: int, end_page: int):
-    """تقسيم ملف PDF وقص النطاق المحدد من الصفحات"""
     from pypdf import PdfReader, PdfWriter
     reader = PdfReader(str(input_path))
     writer = PdfWriter()
-    
     total_pages = len(reader.pages)
-    # التأكد من عدم تجاوز النطاق المطلوب لحدود المستند
     start_idx = max(0, start_page - 1)
     end_idx = min(total_pages, end_page)
-    
     for i in range(start_idx, end_idx):
         writer.add_page(reader.pages[i])
-        
     def _write_split():
         with open(output_path, "wb") as f:
             writer.write(f)
-            
     await asyncio.get_running_loop().run_in_executor(None, _write_split)
 
 
 async def merge_pdf_files(input_paths: list[Path], output_path: Path):
-    """دمج ملفات PDF متعددة في مستند واحد بالتسلسل الكرونولوجي المجمع"""
     from pypdf import PdfWriter
     writer = PdfWriter()
-    
     for path in input_paths:
         writer.append(str(path))
-        
     def _write_merge():
         with open(output_path, "wb") as f:
             writer.write(f)
-            
     await asyncio.get_running_loop().run_in_executor(None, _write_merge)
 
 
@@ -522,6 +612,9 @@ def audio_submenu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎬 فيديو ➜ صوت MP3", callback_data="mode_video2audio")],
         [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
         [InlineKeyboardButton("✂️ قص مقطع صوتي (Trim)", callback_data="mode_trim_audio")],
+        [InlineKeyboardButton("⚡ تغيير سرعة الصوت", callback_data="mode_audio_speed")],
+        [InlineKeyboardButton("🔗 دمج ملفات صوتية", callback_data="mode_merge_audio")],
+        [InlineKeyboardButton("🔊 رفع / خفض الصوت", callback_data="mode_audio_volume")],
         [InlineKeyboardButton("🗣️ تحويل نص إلى صوت (TTS)", callback_data="mode_tts")],
         [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")]
     ]
@@ -529,7 +622,7 @@ def audio_submenu_keyboard() -> InlineKeyboardMarkup:
 
 
 # ----------------------------------------------------------------------
-# لوحة تحكم وإدارة الآدمن (Inline Admin Panel)
+# لوحة تحكم وإدارة الآدمن (Inline Admin Panel - مع قنوات الاشتراك)
 # ----------------------------------------------------------------------
 
 def is_admin(user_id: int) -> bool:
@@ -541,7 +634,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 إحصائيات البوت", callback_data="admin_stats")],
         [InlineKeyboardButton("📢 إذاعة جماعية (Broadcast)", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🚫 حظر مستخدم", callback_data="admin_ban"),
-         InlineKeyboardButton("🟢 إلغاء حظر", callback_data="admin_unban")]
+         InlineKeyboardButton("🟢 إلغاء حظر", callback_data="admin_unban")],
+        [InlineKeyboardButton("🔐 تعيين قناة الاشتراك الإجباري", callback_data="admin_set_sub")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -570,6 +664,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_user_banned(user.id):
         await update.message.reply_text("🚫 نعتذر، حسابك محظور حاليًا.")
         return
+        
+    # فحص الاشتراك الإجباري قبل فتح البوت للمستخدمين
+    channel_username = await get_setting("force_channel")
+    if channel_username and not await check_force_subscription(user.id, context):
+        await update.message.reply_text(
+            f"⚠️ **عذراً، يجب عليك الاشتراك في قناة البوت الرسمية أولاً لاستخدام ميزات معالجة وتحويل الملفات والصوتيات الفورية!**",
+            reply_markup=get_sub_keyboard(channel_username),
+            parse_mode="Markdown"
+        )
+        return
+
     context.user_data.clear()
     await update.message.reply_text("👋 أهلًا بك في بوت تحويل الصيغ والوسائط المحترف!\n💡 اختر القسم المطلوب للبدء:", reply_markup=main_menu_keyboard())
 
@@ -578,6 +683,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     if await is_user_banned(user_id): return
+
+    # في حال نقر المستخدم زر التحقق من الاشتراك مجدداً
+    if query.data == "check_sub_again":
+        channel_username = await get_setting("force_channel")
+        if channel_username and not await check_force_subscription(user_id, context):
+            await query.answer("❌ يبدو أنك لم تشترك في القناة بعد! الرجاء الاشتراك والمحاولة مجدداً.", show_alert=True)
+            return
+        await query.answer("✅ شكراً لك على الاشتراك! تم فتح ميزات البوت الآن.", show_alert=True)
+        context.user_data.clear()
+        await query.edit_message_text("👋 أهلاً بك مجدداً! اختر القسم المطلوب للبدء الفوري:", reply_markup=main_menu_keyboard())
+        return
+
+    # فحص أمني روتيني للاشتراك الإجباري على بقية الأزرار
+    channel_username = await get_setting("force_channel")
+    if channel_username and not await check_force_subscription(user_id, context):
+        await query.answer("⚠️ يجب عليك الاشتراك في القناة الرسمية أولاً!", show_alert=True)
+        return
 
     await query.answer()
     data = query.data
@@ -601,7 +723,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE;")
             total_actions = await conn.fetchval("SELECT COUNT(*) FROM stats_log;")
             await conn.close()
-            await query.edit_message_text(f"📊 **الإحصائيات:**\n👥 مستخدمين: `{total_users}`\n🚫 محظورين: `{banned_users}`\n⚙️ عمليات ناجحة: `{total_actions}`", reply_markup=admin_keyboard(), parse_mode="Markdown")
+            current_chan = await get_setting("force_channel") or "غير محددة ❌"
+            await query.edit_message_text(f"📊 **الإحصائيات:**\n👥 مستخدمين: `{total_users}`\n🚫 محظورين: `{banned_users}`\n⚙️ عمليات ناجحة: `{total_actions}`\n📢 القناة الحالية: `{current_chan}`", reply_markup=admin_keyboard(), parse_mode="Markdown")
         elif data == "admin_broadcast":
             context.user_data["admin_state"] = "WAITING_BROADCAST_MSG"
             await query.edit_message_text("📢 أرسل الآن رسالة الإذاعة:")
@@ -611,6 +734,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "admin_unban":
             context.user_data["admin_state"] = "WAITING_UNBAN_ID"
             await query.edit_message_text("🟢 أرسل الـ User ID لإلغاء حظره:")
+        elif data == "admin_set_sub":
+            context.user_data["admin_state"] = "WAITING_CHANNEL_USER"
+            await query.edit_message_text("🔐 **إعداد الاشتراك الإجباري:**\nأرسل الآن يوزر القناة الجديد (مثال: `@MyChannel`) أو اكتب `تعطيل` لإيقاف الميزة:")
         return
 
     # تفعيل المودات المختارة وتوجيه المستخدم
@@ -639,6 +765,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔗 أرسل ملفات الـ PDF التي تود دمجها متتالية، وعند الانتهاء أرسل كلمة **دمج** للبث وعمل المعالجة.", parse_mode="Markdown")
     elif data == "mode_trim_audio":
         await query.edit_message_text("✂️ أرسل أولاً الملف الصوتي المراد قصه.")
+    elif data == "mode_audio_speed":
+        await query.edit_message_text("⚡ أرسل الملف الصوتي لتعديل وتغيير سرعته.")
+    elif data == "mode_merge_audio":
+        context.user_data["audio_state"] = "WAITING_MERGE_AUDIO"
+        context.user_data["merge_audio_files"] = []
+        await query.edit_message_text("🔗 أرسل الملفات الصوتية متتابعة، ثم أرسل كلمة **دمج** ليتم تجميعها.", parse_mode="Markdown")
+    elif data == "mode_audio_volume":
+        await query.edit_message_text("🔊 أرسل المقطع الصوتي المراد رفع أو خفض حجم ديسيبل الصوت له.")
     elif data == "mode_tts":
         context.user_data["audio_state"] = "WAITING_TTS_TEXT"
         await query.edit_message_text("🗣️ أرسل الآن النص (بالعربية أو الإنجليزية) لتحويله إلى مقطع صوتي مسموع.")
@@ -647,6 +781,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await is_user_banned(user_id): return
+    
+    # حماية الفحص الإجباري للملفات المستلمة مباشرة
+    channel_username = await get_setting("force_channel")
+    if channel_username and not await check_force_subscription(user_id, context):
+        await update.message.reply_text("⚠️ لا يمكنك إرسال ملفات! يجب الاشتراك بقناة البوت الرسمية وتفعيل حسابك عبر /start")
+        return
+
     mode = context.user_data.get("current_mode")
     doc = update.message.document
 
@@ -685,6 +826,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📥 تم استقبال وحفظ الملف رقم ({current_count}) بنجاح.\nأرسل الملف التالي، أو أرسل كلمة **دمج** لإتمام العملية وتحميل الملف النهائي.", parse_mode="Markdown")
         return
 
+    # معالجة استلام ملف صوتي كـ وثيقة (Document) لتعديل سرعته، دمج أو حجم الصوت
+    if Path(doc.file_name).suffix.lower() in AUDIO_EXTENSIONS:
+        if mode == "mode_audio_speed":
+            lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+            context.user_data["speed_source_path"] = str(lp)
+            context.user_data["audio_state"] = "WAITING_SPEED_VALUE"
+            await update.message.reply_text("⏱️ أرسل سرعة المعالجة الصوتية المطلوبة كرقم عشري بين `0.5` و `2.0` (مثال: `1.5` لتسريع المقطع):", parse_mode="Markdown")
+            return
+        elif mode == "mode_merge_audio":
+            lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+            context.user_data.setdefault("merge_audio_files", []).append(str(lp))
+            current_count = len(context.user_data["merge_audio_files"])
+            await update.message.reply_text(f"📥 تم حفظ المقطع المستنداتي رقم ({current_count}). أرسل المقطع التالي أو اكتب **دمج** للإنهاء.")
+            return
+        elif mode == "mode_audio_volume":
+            lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+            context.user_data["volume_source_path"] = str(lp)
+            context.user_data["audio_state"] = "WAITING_VOLUME_VALUE"
+            await update.message.reply_text("🔊 أرسل مستوى الصوت المطلوب بالديسيبل (dB):\nأرسل مثلاً `6` لرفع الصوت، أو `-6` لخفض مستوى الصوت:")
+            return
+
     # معالجة قص الصوت في حال أرسل كملف وثيقة
     if mode == "mode_trim_audio" and (Path(doc.file_name).suffix.lower() in AUDIO_EXTENSIONS):
         lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
@@ -699,16 +861,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """توجيه الرسائل الصوتية للقص أو التعديل العادي"""
-    if await is_user_banned(update.effective_user.id): return
+    user_id = update.effective_user.id
+    if await is_user_banned(user_id): return
+    
+    channel_username = await get_setting("force_channel")
+    if channel_username and not await check_force_subscription(user_id, context):
+        await update.message.reply_text("⚠️ لا يمكنك إرسال وسائط! يرجى التفعيل والاشتراك أولاً عبر /start")
+        return
+        
     mode = context.user_data.get("current_mode")
+    audio = update.message.audio or update.message.voice
     
     if mode == "mode_trim_audio":
-        audio = update.message.audio or update.message.voice
         lp = await download_telegram_file(context, audio.file_id, audio.file_unique_id, getattr(audio, 'file_name', 'voice.ogg'))
         context.user_data["trim_source_path"] = str(lp)
         context.user_data["audio_state"] = "WAITING_TRIM_TIME"
         await update.message.reply_text("⏱️ ممتاز، أرسل الآن توقيت القص بالصيغة التالية تماماً:\n`00:01:10 - 00:02:45`", parse_mode="Markdown")
+        return
+        
+    elif mode == "mode_audio_speed":
+        lp = await download_telegram_file(context, audio.file_id, audio.file_unique_id, getattr(audio, 'file_name', 'voice.ogg'))
+        context.user_data["speed_source_path"] = str(lp)
+        context.user_data["audio_state"] = "WAITING_SPEED_VALUE"
+        await update.message.reply_text("⏱️ أرسل سرعة معالجة الملف الصوتي كرقم عشري (مثلاً `1.25` لتسريع المقطع قليلاً):", parse_mode="Markdown")
+        return
+        
+    elif mode == "mode_merge_audio":
+        lp = await download_telegram_file(context, audio.file_id, audio.file_unique_id, getattr(audio, 'file_name', 'voice.ogg'))
+        context.user_data.setdefault("merge_audio_files", []).append(str(lp))
+        current_count = len(context.user_data["merge_audio_files"])
+        await update.message.reply_text(f"📥 تم حفظ المقطع الصوتي رقم ({current_count}). أرسل التالي أو اكتب **دمج** للبدء في دمجهم.")
+        return
+        
+    elif mode == "mode_audio_volume":
+        lp = await download_telegram_file(context, audio.file_id, audio.file_unique_id, getattr(audio, 'file_name', 'voice.ogg'))
+        context.user_data["volume_source_path"] = str(lp)
+        context.user_data["audio_state"] = "WAITING_VOLUME_VALUE"
+        await update.message.reply_text("🔊 أرسل الآن القيمة بالديسيبل (dB):\nاكتب `5` لرفع الصوت أو `-5` لخفض الصوت بنسبة معينة:")
         return
         
     await audio_handler.handle_audio_message(update, context)
@@ -723,28 +912,37 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf_state = context.user_data.get("pdf_state")
     text = update.message.text.strip()
 
-    # معالجة نطاق قص صفحات الـ PDF مضاف حديثاً
+    # معالجة إعداد وتخصيص يوزر الاشتراك الإجباري بواسطة الآدمن
+    if admin_state == "WAITING_CHANNEL_USER" and is_admin(user_id):
+        context.user_data.pop("admin_state", None)
+        if text == "تعطيل" or text.lower() == "disable":
+            await set_setting("force_channel", "")
+            await update.message.reply_text("🟢 تم تعطيل نظام الاشتراك الإجباري لجميع المستخدمين بنجاح.")
+        else:
+            if not text.startswith("@"):
+                text = f"@{text}"
+            await set_setting("force_channel", text)
+            await update.message.reply_text(f"🔐 تم تفعيل وتثبيت القناة بنجاح!\nيوزر القناة المشروط حالياً: `{text}`\nتأكد من رفع البوت كمشرف داخلها لضمان التحقق.", parse_mode="Markdown")
+        return
+
+    # معالجة نطاق قص صفحات الـ PDF
     if pdf_state == "WAITING_SPLIT_RANGE":
         if "-" not in text:
             await update.message.reply_text("⚠️ يرجى إرسال النطاق بشكل صحيح، مثال: `1-15`", parse_mode="Markdown")
             return
-        
         src_path_str = context.user_data.get("split_pdf_source")
         if not src_path_str:
             await update.message.reply_text("❌ لم يتم العثور على ملف PDF المرفوع مسبقاً، يرجى إعادة المحاولة.")
             return
-            
         context.user_data.pop("pdf_state", None)
         try:
             start_p, end_p = map(int, text.split("-"))
         except ValueError:
             await update.message.reply_text("⚠️ يرجى إدخال أرقام صحيحة، مثال: `1-15`", parse_mode="Markdown")
             return
-            
         msg = await update.message.reply_text("⏳ جاري قص النطاق المحدد من صفحات الـ PDF...")
         src_p = Path(src_path_str)
         out_p = CONVERTED_DIR / f"clipped_{start_p}_to_{end_p}_{src_p.name}"
-        
         try:
             await split_pdf_pages(src_p, out_p, start_p, end_p)
             await log_action("pdf_split")
@@ -761,10 +959,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(files_list) < 2:
             await update.message.reply_text("⚠️ يجب إرسال ملفين PDF على الأقل لتتمكن من دمجهما معاً.")
             return
-            
         context.user_data.pop("pdf_state", None)
         msg = await update.message.reply_text(f"🔗 جاري تجميع ودمج {len(files_list)} ملفات PDF في مستند واحد...")
-        
         out_p = CONVERTED_DIR / f"merged_document_{int(time.time())}.pdf"
         try:
             input_paths = [Path(p) for p in files_list]
@@ -778,6 +974,74 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ حدث خطأ غير متوقع أثناء معالجة دمج الملفات: {e}")
         return
 
+    # تنفيذ دمج الأصوات عند كتابة "دمج"
+    if state == "WAITING_MERGE_AUDIO" and (text == "دمج" or text.lower() == "merge"):
+        audio_list = context.user_data.get("merge_audio_files", [])
+        if len(audio_list) < 2:
+            await update.message.reply_text("⚠️ يجب إرسال ملفين صوتيين على الأقل لدمجهم معاً.")
+            return
+        context.user_data.pop("audio_state", None)
+        msg = await update.message.reply_text("⏳ جاري دمج المقاطع الصوتية في حاوية موحدة...")
+        out_p = CONVERTED_DIR / f"merged_audio_{int(time.time())}.mp3"
+        try:
+            input_paths = [Path(p) for p in audio_list]
+            await merge_audio_files(input_paths, out_p)
+            await log_action("audio_merge")
+            with open(out_p, "rb") as f:
+                await update.message.reply_audio(audio=f, caption="🔗 تم دمج كافة المقاطع الصوتية المرفوعة بنجاح بالتتالي!")
+            await msg.delete()
+            context.user_data.pop("merge_audio_files", None)
+        except Exception as e:
+            await msg.edit_text(f"❌ حدث خطأ غير متوقع أثناء دمج الأصوات: {e}")
+        return
+
+    # تنفيذ تغيير سرعة الصوت
+    if state == "WAITING_SPEED_VALUE":
+        try:
+            speed_val = float(text)
+            if not (0.5 <= speed_val <= 2.0):
+                await update.message.reply_text("⚠️ يرجى إدخال قيمة سرعة منطقية وتتراوح ما بين 0.5 إلى 2.0 فقط.")
+                return
+        except ValueError:
+            await update.message.reply_text("⚠️ يرجى إدخال رقم عشري صحيح (مثال: `1.5`)")
+            return
+        context.user_data.pop("audio_state", None)
+        src_path = context.user_data.get("speed_source_path")
+        msg = await update.message.reply_text("⏳ جاري معالجة السرعة وتعديل التزامن الفني للملف الحركي...")
+        src_p = Path(src_path)
+        out_p = CONVERTED_DIR / f"speed_{speed_val}_{src_p.name}"
+        try:
+            await change_audio_speed(src_p, out_p, speed_val)
+            await log_action("audio_speed")
+            with open(out_p, "rb") as f:
+                await update.message.reply_audio(audio=f, caption=f"⚡ تم تعديل ومعالجة سرعة الصوت إلى {speed_val}x بنجاح!")
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ حدث خطأ أثناء المعالجة: {e}")
+        return
+
+    # تنفيذ تعديل ديسيبل وحجم الصوت
+    if state == "WAITING_VOLUME_VALUE":
+        try:
+            vol_val = float(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ يرجى إدخال رقم عشري أو صحيح نقي (مثال: `5` أو `-5`):")
+            return
+        context.user_data.pop("audio_state", None)
+        src_path = context.user_data.get("volume_source_path")
+        msg = await update.message.reply_text("⏳ جاري تعديل هندسة ومستوى ارتفاع الصوت الجاري...")
+        src_p = Path(src_path)
+        out_p = CONVERTED_DIR / f"vol_{vol_val}_{src_p.name}"
+        try:
+            await change_audio_volume(src_p, out_p, vol_val)
+            await log_action("audio_volume")
+            with open(out_p, "rb") as f:
+                await update.message.reply_audio(audio=f, caption=f"🔊 تم تعديل حجم الصوت بمقدار {vol_val}dB بنجاح!")
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ خطأ هندسي أثناء معالجة التردد: {e}")
+        return
+
     # معالجة النص الموجه لـ TTS
     if state == "WAITING_TTS_TEXT":
         context.user_data.pop("audio_state", None)
@@ -786,11 +1050,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from gtts import gTTS
             out_p = CONVERTED_DIR / f"tts_{update.message.message_id}.mp3"
             lang = 'ar' if any(u'\u0600' <= c <= u'\u06FF' for c in text) else 'en'
-            
             def _generate_tts():
                 tts = gTTS(text=text, lang=lang, slow=False)
                 tts.save(str(out_p))
-            
             await asyncio.get_running_loop().run_in_executor(None, _generate_tts)
             await log_action("tts_generated")
             with open(out_p, "rb") as f:
@@ -809,15 +1071,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = text.split(" - ")
         start_t, end_t = parts[0].strip(), parts[1].strip()
         src_path = context.user_data.get("trim_source_path")
-        
         if not src_path:
             await update.message.reply_text("❌ حدث خطأ، لم يتم العثور على الملف الصوتي الأصلي.")
             return
-            
         msg = await update.message.reply_text("⏳ جاري قطع المقطع المحدد بدقة متناهية عبر ffmpeg...")
         src_p = Path(src_path)
         out_p = CONVERTED_DIR / f"trimmed_{src_p.name}"
-        
         try:
             await trim_audio_file(src_p, out_p, start_t, end_t)
             await log_action("audio_trim")
@@ -876,7 +1135,14 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await is_user_banned(update.effective_user.id): return
+    user_id = update.effective_user.id
+    if await is_user_banned(user_id): return
+    
+    channel_username = await get_setting("force_channel")
+    if channel_username and not await check_force_subscription(user_id, context):
+        await update.message.reply_text("⚠️ لا يمكنك إرسال صور! يرجى الاشتراك بقناة البوت أولاً عبر /start")
+        return
+
     if context.user_data.get("audio_state") == "WATING_ART":
         await audio_handler.handle_photo_as_art(update, context, update.message.photo[-1])
         return
@@ -922,7 +1188,7 @@ def main():
 
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
-    logger.info("🚀 البوت انطلق رسميًا بكافة ميزات الضغط، القص والـ TTS المضافة...")
+    logger.info("🚀 البوت انطلق رسميًا بكافة ميزات الضغط، الاشتراك الإجباري والتحكم الصوتي المتقدم...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
 
 
