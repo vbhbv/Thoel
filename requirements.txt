@@ -5,3 +5,4 @@ img2pdf==0.5.1
 python-docx==1.1.2
 pypdf==5.5.0
 asyncpg==0.29.0
+gTTS==2.5.1
