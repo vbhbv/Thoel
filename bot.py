@@ -1,6 +1,7 @@
 """
 بوت تليجرام متقدم لتحويل الصيغ، تعديل الـ Metadata للوسائط، وحماية ملفات PDF.
 تمت إضافة ميزات: ضغط الـ PDF بشريط تقدم حقيقي، قص الصوت (Trim)، وتحويل النص إلى صوت (TTS).
+تحديث جديد: دمج ملفات PDF المتعددة، وتقسيم وقص نطاق معين من صفحات الـ PDF.
 مدمج بالكامل مع قاعدة بيانات PostgreSQL ونظام لوحة تحكم الآدمن التفاعلية (Inline Panel).
 مصمم للنشر المستقر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري.
 """
@@ -450,6 +451,46 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
 
 
 # ----------------------------------------------------------------------
+# آليات معالجة تقسيم ودمج الـ PDF المضافة حديثاً
+# ----------------------------------------------------------------------
+
+async def split_pdf_pages(input_path: Path, output_path: Path, start_page: int, end_page: int):
+    """تقسيم ملف PDF وقص النطاق المحدد من الصفحات"""
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(str(input_path))
+    writer = PdfWriter()
+    
+    total_pages = len(reader.pages)
+    # التأكد من عدم تجاوز النطاق المطلوب لحدود المستند
+    start_idx = max(0, start_page - 1)
+    end_idx = min(total_pages, end_page)
+    
+    for i in range(start_idx, end_idx):
+        writer.add_page(reader.pages[i])
+        
+    def _write_split():
+        with open(output_path, "wb") as f:
+            writer.write(f)
+            
+    await asyncio.get_running_loop().run_in_executor(None, _write_split)
+
+
+async def merge_pdf_files(input_paths: list[Path], output_path: Path):
+    """دمج ملفات PDF متعددة في مستند واحد بالتسلسل الكرونولوجي المجمع"""
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    
+    for path in input_paths:
+        writer.append(str(path))
+        
+    def _write_merge():
+        with open(output_path, "wb") as f:
+            writer.write(f)
+            
+    await asyncio.get_running_loop().run_in_executor(None, _write_merge)
+
+
+# ----------------------------------------------------------------------
 # كيبورد اللوحات والقوائم التفاعلية
 # ----------------------------------------------------------------------
 
@@ -465,6 +506,8 @@ def files_submenu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
+        [InlineKeyboardButton("✂️ قص صفحات PDF", callback_data="mode_split_pdf")],
+        [InlineKeyboardButton("🔗 دمج ملفات PDF", callback_data="mode_merge_pdf")],
         [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
         [InlineKeyboardButton("🔒 تشفير حماية الـ PDF", callback_data="mode_encrypt_pdf")],
@@ -588,6 +631,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔒 أرسل الآن ملف PDF لحمايته وتشفيره بكلمة مرور.")
     elif data == "mode_compress_pdf":
         await query.edit_message_text("🗜️ أرسل ملف الـ PDF الذي تود ضغطه وتقليص حجمه الآن.")
+    elif data == "mode_split_pdf":
+        await query.edit_message_text("✂️ أرسل أولاً ملف الـ PDF الذي ترغب بقص صفحات منه.")
+    elif data == "mode_merge_pdf":
+        context.user_data["pdf_state"] = "WAITING_MERGE_FILES"
+        context.user_data["merge_files"] = []
+        await query.edit_message_text("🔗 أرسل ملفات الـ PDF التي تود دمجها متتالية، وعند الانتهاء أرسل كلمة **دمج** للبث وعمل المعالجة.", parse_mode="Markdown")
     elif data == "mode_trim_audio":
         await query.edit_message_text("✂️ أرسل أولاً الملف الصوتي المراد قصه.")
     elif data == "mode_tts":
@@ -599,19 +648,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await is_user_banned(user_id): return
     mode = context.user_data.get("current_mode")
+    doc = update.message.document
 
-    # معالجة ضغط PDF (الميزة الثانية المحمية والمزودة بشريط تقدم حقيقي)
-    if mode == "mode_compress_pdf" and update.message.document.file_name.lower().endswith('.pdf'):
+    # معالجة ضغط PDF 
+    if mode == "mode_compress_pdf" and doc.file_name.lower().endswith('.pdf'):
         msg = await update.message.reply_text("⏳ جاري تهيئة وتحميل ملف الـ PDF لبدء الضغط الحركي...")
-        doc = update.message.document
-        
         try:
             lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
             out_p = CONVERTED_DIR / f"compressed_{doc.file_name}"
-            
-            # استدعاء دالة المعالجة المحدثة
             await compress_pdf_file_async(lp, out_p, update, context, msg)
-            
             await log_action("compress_pdf")
             with open(out_p, "rb") as f:
                 await update.message.reply_document(document=f, filename=out_p.name, caption="✅ تم ضغط الملف وتقليل الحجم بنجاح!")
@@ -622,9 +667,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.delete()
         return
 
-    # معالجة قص الصوت في حال أرسل كملف وثيقة (الميزة الثالثة)
-    if mode == "mode_trim_audio" and (Path(update.message.document.file_name).suffix.lower() in AUDIO_EXTENSIONS):
-        doc = update.message.document
+    # معالجة استلام ملف الـ PDF تمهيداً لقصّه
+    if mode == "mode_split_pdf" and doc.file_name.lower().endswith('.pdf'):
+        lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+        context.user_data["split_pdf_source"] = str(lp)
+        context.user_data["pdf_state"] = "WAITING_SPLIT_RANGE"
+        await update.message.reply_text("⏱️ ممتاز، تم حفظ الملف الأصلي.\nأرسل الآن نطاق الصفحات المطلوب قصها تماماً كالتالي:\n`1-15`", parse_mode="Markdown")
+        return
+
+    # معالجة استقبال ملفات PDF المتعددة للدمج
+    if mode == "mode_merge_pdf" and doc.file_name.lower().endswith('.pdf'):
+        lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+        if "merge_files" not in context.user_data:
+            context.user_data["merge_files"] = []
+        context.user_data["merge_files"].append(str(lp))
+        current_count = len(context.user_data["merge_files"])
+        await update.message.reply_text(f"📥 تم استقبال وحفظ الملف رقم ({current_count}) بنجاح.\nأرسل الملف التالي، أو أرسل كلمة **دمج** لإتمام العملية وتحميل الملف النهائي.", parse_mode="Markdown")
+        return
+
+    # معالجة قص الصوت في حال أرسل كملف وثيقة
+    if mode == "mode_trim_audio" and (Path(doc.file_name).suffix.lower() in AUDIO_EXTENSIONS):
         lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
         context.user_data["trim_source_path"] = str(lp)
         context.user_data["audio_state"] = "WAITING_TRIM_TIME"
@@ -661,14 +723,68 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf_state = context.user_data.get("pdf_state")
     text = update.message.text.strip()
 
-    # معالجة النص الموجه لـ TTS (الميزة الرابعة)
+    # معالجة نطاق قص صفحات الـ PDF مضاف حديثاً
+    if pdf_state == "WAITING_SPLIT_RANGE":
+        if "-" not in text:
+            await update.message.reply_text("⚠️ يرجى إرسال النطاق بشكل صحيح، مثال: `1-15`", parse_mode="Markdown")
+            return
+        
+        src_path_str = context.user_data.get("split_pdf_source")
+        if not src_path_str:
+            await update.message.reply_text("❌ لم يتم العثور على ملف PDF المرفوع مسبقاً، يرجى إعادة المحاولة.")
+            return
+            
+        context.user_data.pop("pdf_state", None)
+        try:
+            start_p, end_p = map(int, text.split("-"))
+        except ValueError:
+            await update.message.reply_text("⚠️ يرجى إدخال أرقام صحيحة، مثال: `1-15`", parse_mode="Markdown")
+            return
+            
+        msg = await update.message.reply_text("⏳ جاري قص النطاق المحدد من صفحات الـ PDF...")
+        src_p = Path(src_path_str)
+        out_p = CONVERTED_DIR / f"clipped_{start_p}_to_{end_p}_{src_p.name}"
+        
+        try:
+            await split_pdf_pages(src_p, out_p, start_p, end_p)
+            await log_action("pdf_split")
+            with open(out_p, "rb") as f:
+                await update.message.reply_document(document=f, filename=out_p.name, caption=f"✂️ تم قص الصفحات من {start_p} إلى {end_p} بنجاح!")
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ حدث خطأ أثناء معالجة وتقسيم الملف: {e}")
+        return
+
+    # معالجة تجميع ودمج ملفات الـ PDF عند كتابة "دمج"
+    if pdf_state == "WAITING_MERGE_FILES" and (text == "دمج" or text.lower() == "merge"):
+        files_list = context.user_data.get("merge_files", [])
+        if len(files_list) < 2:
+            await update.message.reply_text("⚠️ يجب إرسال ملفين PDF على الأقل لتتمكن من دمجهما معاً.")
+            return
+            
+        context.user_data.pop("pdf_state", None)
+        msg = await update.message.reply_text(f"🔗 جاري تجميع ودمج {len(files_list)} ملفات PDF في مستند واحد...")
+        
+        out_p = CONVERTED_DIR / f"merged_document_{int(time.time())}.pdf"
+        try:
+            input_paths = [Path(p) for p in files_list]
+            await merge_pdf_files(input_paths, out_p)
+            await log_action("pdf_merge")
+            with open(out_p, "rb") as f:
+                await update.message.reply_document(document=f, filename="Merged_Document.pdf", caption="🔗 تم دمج جميع الملفات المرفوعة بنجاح في ملف واحد!")
+            await msg.delete()
+            context.user_data.pop("merge_files", None)
+        except Exception as e:
+            await msg.edit_text(f"❌ حدث خطأ غير متوقع أثناء معالجة دمج الملفات: {e}")
+        return
+
+    # معالجة النص الموجه لـ TTS
     if state == "WAITING_TTS_TEXT":
         context.user_data.pop("audio_state", None)
         msg = await update.message.reply_text("⏳ جاري توليد مقطع الصوت من النص النطقي الفصيح...")
         try:
             from gtts import gTTS
             out_p = CONVERTED_DIR / f"tts_{update.message.message_id}.mp3"
-            # فحص تلقائي للغة: إذا احتوى على حروف عربية ينطق بالعربية وإلا بالإنجليزية
             lang = 'ar' if any(u'\u0600' <= c <= u'\u06FF' for c in text) else 'en'
             
             def _generate_tts():
@@ -684,7 +800,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ فشل توليد الصوت: {e}")
         return
 
-    # معالجة توقيت قص الصوت (الميزة الثالثة)
+    # معالجة توقيت قص الصوت
     if state == "WAITING_TRIM_TIME":
         if " - " not in text:
             await update.message.reply_text("⚠️ يرجى إرسال التوقيت بشكل صحيح متضمناً الفاصلة الوسطية، مثال:\n`00:00:10 - 00:00:40`", parse_mode="Markdown")
@@ -712,7 +828,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ خطأ: {e}")
         return
 
-    # باقي معالجات الآدمن وتعديل الميتاداتا
+    # معالجات الآدمن وتعديل الميتاداتا
     if admin_state and is_admin(user_id):
         if admin_state == "WAITING_BROADCAST_MSG":
             context.user_data.pop("admin_state", None)
