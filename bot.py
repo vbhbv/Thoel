@@ -1,5 +1,6 @@
 """
 بوت تليجرام متقدم لتحويل الصيغ، تعديل الـ Metadata للوسائط، وحماية ملفات PDF.
+تمت إضافة ميزات: ضغط الـ PDF، قص الصوت (Trim)، وتحويل النص إلى صوت (TTS).
 مدمج بالكامل مع قاعدة بيانات PostgreSQL ونظام لوحة تحكم الآدمن التفاعلية (Inline Panel).
 مصمم للنشر المستقر على Railway مع إدارة صارمة للذاكرة والتنظيف الدوري.
 """
@@ -235,7 +236,7 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
                 audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
             audio.save()
     except Exception as e:
-        logger.error(f"خطأ غير متوقع في Mutagen للصيغة {ext}: {e}")
+        logger.error(f"خطأ غير متوقع in Mutagen للصيغة {ext}: {e}")
 
 
 async def convert_docx_to_pdf(input_path: Path, out_dir: Path) -> Path:
@@ -342,6 +343,28 @@ def encrypt_pdf_file(input_path: Path, output_path: Path, password: str):
         writer.write(f)
 
 
+def compress_pdf_file(input_path: Path, output_path: Path):
+    """الميزة الثانية: ضغط ملف PDF لتقليل الحجم بشكل كبير"""
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(str(input_path))
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.compress_content_streams()  # ضغط المحتوى النصي والجداول
+        writer.add_page(page)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+
+async def trim_audio_file(input_path: Path, output_path: Path, start_time: str, end_time: str):
+    """الميزة الثالثة: قص مقطع صوتي باستخدام ffmpeg عبر التوقيت المرسل"""
+    code, out, err = await run_cmd(
+        "ffmpeg", "-y", "-ss", start_time, "-to", end_time, 
+        "-i", str(input_path), "-acodec", "copy", str(output_path)
+    )
+    if code != 0 or not output_path.exists():
+        raise RuntimeError(f"فشل قص الصوت، تأكد من صحة كتابة الوقت المتطابق: {err[-300:]}")
+
+
 async def process_epub_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, filename: str):
     msg = await update.message.reply_text("⏳ جاري تحويل الكتاب الإلكتروني...")
     try:
@@ -378,7 +401,7 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
             audio=f,
             title=title if title else audio_path.stem,
             performer=artist if artist else "فنان غير معروف",
-            caption="✅ تم تحديث الـ Tags وحقن الغلاف بنجاح عبر Mutagen!"
+            caption="✅ تم تحديث الـ Tags وحقن الغلاف بنجاح!"
         )
 
     for key in ["audio_state", "ready_audio_path", "meta_title", "meta_artist", "meta_art_path", "pending_audio", "pending_video"]:
@@ -386,11 +409,10 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
 
 
 # ----------------------------------------------------------------------
-# كيبورد اللوحات والقوائم التفاعلية للمخدمين (هيكلية الأزرار الذكية الجديدة)
+# كيبورد اللوحات والقوائم التفاعلية
 # ----------------------------------------------------------------------
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    # الواجهة الرئيسية تحتوي على زرين رئيسيين فقط
     buttons = [
         [InlineKeyboardButton("📂 أدوات تعديل الملفات", callback_data="sub_files")],
         [InlineKeyboardButton("🎵 أدوات تعديل الصوتيات", callback_data="sub_audio")]
@@ -399,23 +421,24 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def files_submenu_keyboard() -> InlineKeyboardMarkup:
-    # القائمة الفرعية الخاصة بالملفات والمستندات
     buttons = [
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
         [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
         [InlineKeyboardButton("🔒 تشفير حماية الـ PDF", callback_data="mode_encrypt_pdf")],
+        [InlineKeyboardButton("🗜️ ضغط ملف PDF (تقليل الحجم)", callback_data="mode_compress_pdf")],
         [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(buttons)
 
 
 def audio_submenu_keyboard() -> InlineKeyboardMarkup:
-    # القائمة الفرعية الخاصة بالصوتيات والميديا
     buttons = [
         [InlineKeyboardButton("🎬 فيديو ➜ صوت MP3", callback_data="mode_video2audio")],
         [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
+        [InlineKeyboardButton("✂️ قص مقطع صوتي (Trim)", callback_data="mode_trim_audio")],
+        [InlineKeyboardButton("🗣️ تحويل نص إلى صوت (TTS)", callback_data="mode_tts")],
         [InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(buttons)
@@ -442,7 +465,6 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    
     await update.message.reply_text(
         "⚙️ **لوحة تحكم الإدارة وقاعدة البيانات الاحترافية**\nاختر من الأزرار الإجراء المطلوب:",
         reply_markup=admin_keyboard(),
@@ -450,7 +472,6 @@ async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-# استيراد موديولات التقسيم بعد ثبات تعريفات ثوابت ودوال bot المشتركة منعاً للـ Circular Import
 import files_handler
 import audio_handler
 
@@ -462,31 +483,21 @@ import audio_handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await register_user(user.id, user.username)
-    
     if await is_user_banned(user.id):
-        await update.message.reply_text("🚫 نعتذر، حسابك محظور حاليًا من استخدام خدمات البوت.")
+        await update.message.reply_text("🚫 نعتذر، حسابك محظور حاليًا.")
         return
-
     context.user_data.clear()
-    text = (
-        "👋 أهلًا بك في بوت تحويل الصيغ المتقدم وتعديل وسائط الميديا المحترف!\n\n"
-        "💡 اختر القسم المطلوب من الأزرار أدناه للبدء:"
-    )
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    await update.message.reply_text("👋 أهلًا بك في بوت تحويل الصيغ والوسائط المحترف!\n💡 اختر القسم المطلوب للبدء:", reply_markup=main_menu_keyboard())
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    
-    if await is_user_banned(user_id):
-        await query.answer("🚫 حسابك محظور.", show_alert=True)
-        return
+    if await is_user_banned(user_id): return
 
     await query.answer()
     data = query.data
 
-    # التنقل بين القوائم الفرعية والرئيسية
     if data == "sub_files":
         await query.edit_message_text("📂 **قسم أدوات تعديل الملفات:**\nاختر الأداة المطلوبة:", reply_markup=files_submenu_keyboard(), parse_mode="Markdown")
         return
@@ -497,64 +508,77 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("👋 اختر القسم المطلوب من الأزرار أدناه للبدء:", reply_markup=main_menu_keyboard())
         return
 
+    # معالجة الآدمن الفورية
     if data.startswith("admin_"):
         if not is_admin(user_id): return
-        
         if data == "admin_stats":
-            await query.edit_message_text("⏳ جاري جلب الإحصائيات الحية من PostgreSQL...")
-            try:
-                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
-                total_users = await conn.fetchval("SELECT COUNT(*) FROM users;")
-                banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE;")
-                total_actions = await conn.fetchval("SELECT COUNT(*) FROM stats_log;")
-                await conn.close()
-
-                stats_text = (
-                    "📊 **إحصائيات النظام الحالية:**\n\n"
-                    f"👥 إجمالي المستخدمين المسجلين: `{total_users}`\n"
-                    f"🚫 عدد المستخدمين المحظورين: `{banned_users}`\n"
-                    f"⚙️ إجمالي العمليات الناجحة: `{total_actions}`\n"
-                )
-                await query.edit_message_text(stats_text, reply_markup=admin_keyboard(), parse_mode="Markdown")
-            except Exception as e:
-                await query.edit_message_text(f"❌ خطأ الإحصائيات: {e}", reply_markup=admin_keyboard())
-        
+            conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users;")
+            banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE;")
+            total_actions = await conn.fetchval("SELECT COUNT(*) FROM stats_log;")
+            await conn.close()
+            await query.edit_message_text(f"📊 **الإحصائيات:**\n👥 مستخدمين: `{total_users}`\n🚫 محظورين: `{banned_users}`\n⚙️ عمليات ناجحة: `{total_actions}`", reply_markup=admin_keyboard(), parse_mode="Markdown")
         elif data == "admin_broadcast":
             context.user_data["admin_state"] = "WAITING_BROADCAST_MSG"
-            await query.edit_message_text("📢 أرسل الآن الرسالة أو الملف الذي تود إذاعته جماعيًا لجميع المستخدمين:")
-        
+            await query.edit_message_text("📢 أرسل الآن رسالة الإذاعة:")
         elif data == "admin_ban":
             context.user_data["admin_state"] = "WAITING_BAN_ID"
-            await query.edit_message_text("🚫 أرسل الـ `User ID` الخاص بالمستخدم المراد حظره:")
-        
+            await query.edit_message_text("🚫 أرسل الـ User ID لحظره:")
         elif data == "admin_unban":
             context.user_data["admin_state"] = "WAITING_UNBAN_ID"
-            await query.edit_message_text("🟢 أرسل الـ `User ID` الخاص بالمستخدم لإلغاء الحظر عنه:")
+            await query.edit_message_text("🟢 أرسل الـ User ID لإلغاء حظره:")
         return
 
+    # تفعيل المودات المختارة وتوجيه المستخدم
+    context.user_data["current_mode"] = data
     if data == "mode_word2pdf":
         await query.edit_message_text("📄 أرسل الآن ملف Word (.doc أو .docx) لتحويله إلى PDF.")
     elif data == "mode_pdf2word":
         await query.edit_message_text("📄 أرسل الآن ملف PDF لتحويله إلى Word.")
     elif data == "mode_video2audio":
-        await query.edit_message_text("🎬 أرسل الآن ملف الفيديو لاستخراج الصوت منه بصيغة MP3 نقي.")
+        await query.edit_message_text("🎬 أرسل ملف الفيديو لاستخراج الصوت منه بصيغة MP3.")
     elif data == "mode_ebook":
-        await query.edit_message_text("📚 أرسل الآن ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
+        await query.edit_message_text("📚 أرسل ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
     elif data == "mode_audio":
-        await query.edit_message_text("🎵 أرسل الآن الملف الصوتي المراد تعديله أو تحويل صيغته.")
+        await query.edit_message_text("🎵 أرسل الملف الصوتي المراد تعديله أو تحويل صيغته.")
     elif data == "mode_image":
-        await query.edit_message_text("🖼️ أرسل الآن الصورة أو مجموعة الصور المراد تجميعها.")
+        await query.edit_message_text("🖼️ أرسل الصورة أو مجموعة الصور المراد تجميعها.")
     elif data == "mode_encrypt_pdf":
         await query.edit_message_text("🔒 أرسل الآن ملف PDF لحمايته وتشفيره بكلمة مرور.")
+    elif data == "mode_compress_pdf":
+        await query.edit_message_text("🗜️ أرسل ملف الـ PDF الذي تود ضغطه وتقليص حجمه الآن.")
+    elif data == "mode_trim_audio":
+        await query.edit_message_text("✂️ أرسل أولاً الملف الصوتي المراد قصه.")
+    elif data == "mode_tts":
+        context.user_data["audio_state"] = "WAITING_TTS_TEXT"
+        await query.edit_message_text("🗣️ أرسل الآن النص (بالعربية أو الإنجليزية) لتحويله إلى مقطع صوتي مسموع.")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await register_user(user.id, user.username)
-    if await is_user_banned(user.id): return
+    user_id = update.effective_user.id
+    if await is_user_banned(user_id): return
+    mode = context.user_data.get("current_mode")
 
-    if context.user_data.get("audio_state") == "WATING_ART":
-        await audio_handler.handle_photo_as_art(update, context, update.message.document)
+    # معالجة ضغط PDF (الميزة الثانية)
+    if mode == "mode_compress_pdf" and update.message.document.file_name.lower().endswith('.pdf'):
+        msg = await update.message.reply_text("⏳ جاري ضغط ملف الـ PDF وتحسين المساحة...")
+        doc = update.message.document
+        lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+        out_p = CONVERTED_DIR / f"compressed_{doc.file_name}"
+        await asyncio.get_running_loop().run_in_executor(None, compress_pdf_file, lp, out_p)
+        await log_action("compress_pdf")
+        with open(out_p, "rb") as f:
+            await update.message.reply_document(document=f, filename=out_p.name, caption="✅ تم ضغط الملف وتقليل الحجم بنجاح!")
+        await msg.delete()
+        return
+
+    # معالجة قص الصوت في حال أرسل كملف وثيقة (الميزة الثالثة)
+    if mode == "mode_trim_audio" and (Path(update.message.document.file_name).suffix.lower() in AUDIO_EXTENSIONS):
+        doc = update.message.document
+        lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, doc.file_name)
+        context.user_data["trim_source_path"] = str(lp)
+        context.user_data["audio_state"] = "WAITING_TRIM_TIME"
+        await update.message.reply_text("⏱️ ممتاز، أرسل الآن توقيت القص بالصيغة التالية تماماً:\n`00:01:10 - 00:02:45`\n(أي من الدقيقة 1 و10 ثواني إلى الدقيقة 2 و45 ثانية)", parse_mode="Markdown")
         return
 
     is_handled = await files_handler.handle_files_document(update, context)
@@ -562,22 +586,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await audio_handler.handle_audio_document(update, context)
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await register_user(user.id, user.username)
-    if await is_user_banned(user.id): return
-
-    if context.user_data.get("audio_state") == "WATING_ART":
-        await audio_handler.handle_photo_as_art(update, context, update.message.photo[-1])
+async def handle_audio_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """توجيه الرسائل الصوتية للقص أو التعديل العادي"""
+    if await is_user_banned(update.effective_user.id): return
+    mode = context.user_data.get("current_mode")
+    
+    if mode == "mode_trim_audio":
+        audio = update.message.audio or update.message.voice
+        lp = await download_telegram_file(context, audio.file_id, audio.file_unique_id, getattr(audio, 'file_name', 'voice.ogg'))
+        context.user_data["trim_source_path"] = str(lp)
+        context.user_data["audio_state"] = "WAITING_TRIM_TIME"
+        await update.message.reply_text("⏱️ ممتاز، أرسل الآن توقيت القص بالصيغة التالية تماماً:\n`00:01:10 - 00:02:45`", parse_mode="Markdown")
         return
-
-    await files_handler.handle_files_photo(update, context)
+        
+    await audio_handler.handle_audio_message(update, context)
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = update.effective_user
-    await register_user(user.id, user.username)
     if await is_user_banned(user_id): return
 
     admin_state = context.user_data.get("admin_state")
@@ -585,74 +611,110 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf_state = context.user_data.get("pdf_state")
     text = update.message.text.strip()
 
+    # معالجة النص الموجه لـ TTS (الميزة الرابعة)
+    if state == "WAITING_TTS_TEXT":
+        context.user_data.pop("audio_state", None)
+        msg = await update.message.reply_text("⏳ جاري توليد مقطع الصوت من النص النطقي الفصيح...")
+        try:
+            from gtts import gTTS
+            out_p = CONVERTED_DIR / f"tts_{update.message.message_id}.mp3"
+            # فحص تلقائي للغة: إذا احتوى على حروف عربية ينطق بالعربية وإلا بالإنجليزية
+            lang = 'ar' if any(u'\u0600' <= c <= u'\u06FF' for c in text) else 'en'
+            
+            def _generate_tts():
+                tts = gTTS(text=text, lang=lang, slow=False)
+                tts.save(str(out_p))
+            
+            await asyncio.get_running_loop().run_in_executor(None, _generate_tts)
+            await log_action("tts_generated")
+            with open(out_p, "rb") as f:
+                await update.message.reply_audio(audio=f, caption="🗣️ تم توليد النطق الصوتي التلقائي بنجاح!")
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ فشل توليد الصوت: {e}")
+        return
+
+    # معالجة توقيت قص الصوت (الميزة الثالثة)
+    if state == "WAITING_TRIM_TIME":
+        if " - " not in text:
+            await update.message.reply_text("⚠️ يرجى إرسال التوقيت بشكل صحيح متضمناً الفاصلة الوسطية، مثال:\n`00:00:10 - 00:00:40`", parse_mode="Markdown")
+            return
+        context.user_data.pop("audio_state", None)
+        parts = text.split(" - ")
+        start_t, end_t = parts[0].strip(), parts[1].strip()
+        src_path = context.user_data.get("trim_source_path")
+        
+        if not src_path:
+            await update.message.reply_text("❌ حدث خطأ، لم يتم العثور على الملف الصوتي الأصلي.")
+            return
+            
+        msg = await update.message.reply_text("⏳ جاري قطع المقطع المحدد بدقة متناهية عبر ffmpeg...")
+        src_p = Path(src_path)
+        out_p = CONVERTED_DIR / f"trimmed_{src_p.name}"
+        
+        try:
+            await trim_audio_file(src_p, out_p, start_t, end_t)
+            await log_action("audio_trim")
+            with open(out_p, "rb") as f:
+                await update.message.reply_audio(audio=f, caption=f"✂️ تم قص المقطع بنجاح من {start_t} إلى {end_t}!")
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ خطأ: {e}")
+        return
+
+    # باقي معالجات الآدمن وتعديل الميتاداتا
     if admin_state and is_admin(user_id):
         if admin_state == "WAITING_BROADCAST_MSG":
             context.user_data.pop("admin_state", None)
-            status_msg = await update.message.reply_text("⏳ جاري بدء الإذاعة الجماعية لكافة المستخدمين النشطين...")
-            try:
-                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
-                rows = await conn.fetch("SELECT user_id FROM users WHERE is_banned = FALSE;")
-                await conn.close()
-            except Exception as e:
-                await status_msg.edit_text(f"❌ فشل جلب المشتركين من القاعدة: {e}")
-                return
-
+            status_msg = await update.message.reply_text("⏳ جاري بدء الإذاعة الجماعية...")
+            conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+            rows = await conn.fetch("SELECT user_id FROM users WHERE is_banned = FALSE;")
+            await conn.close()
             success, failed = 0, 0
             for row in rows:
-                target_id = row["user_id"]
-                if target_id == user_id: continue
+                if row["user_id"] == user_id: continue
                 try:
-                    await context.bot.copy_message(chat_id=target_id, from_chat_id=update.message.chat_id, message_id=update.message.message_id)
+                    await context.bot.copy_message(chat_id=row["user_id"], from_chat_id=update.message.chat_id, message_id=update.message.message_id)
                     success += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    failed += 1
-
-            await status_msg.edit_text(f"📢 **اكتملت الإذاعة الجماعية بنجاح!**\n\n✅ تم الإرسال إلى: `{success}`\n❌ فشل الإرسال إلى: `{failed}`", parse_mode="Markdown")
+                    await asyncio.sleep(0.04)
+                except: failed += 1
+            await status_msg.edit_text(f"📢 **اكتملت الإذاعة!**\n✅ تم إرسال لـ: `{success}`\n❌ فشل لـ: `{failed}`", parse_mode="Markdown")
             return
-
         elif admin_state == "WAITING_BAN_ID":
             context.user_data.pop("admin_state", None)
-            if not text.isdigit():
-                await update.message.reply_text("⚠️ المعرف يجب أن يكون رقمًا فقط.")
-                return
-            try:
-                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
-                await conn.execute("UPDATE users SET is_banned = TRUE WHERE user_id = $1;", int(text))
-                await conn.close()
-                await update.message.reply_text(f"✅ تم حظر المستخدم `{text}` بنجاح ومنعه من البوت.", parse_mode="Markdown")
-            except Exception as e:
-                await update.message.reply_text(f"❌ خطأ أثناء الحظر: {e}")
+            conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+            await conn.execute("UPDATE users SET is_banned = TRUE WHERE user_id = $1;", int(text))
+            await conn.close()
+            await update.message.reply_text("✅ تم حظر المستخدم بنجاح.")
             return
-
         elif admin_state == "WAITING_UNBAN_ID":
             context.user_data.pop("admin_state", None)
-            if not text.isdigit():
-                await update.message.reply_text("⚠️ المعرف يجب أن يكون رقمًا فقط.")
-                return
-            try:
-                conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
-                await conn.execute("UPDATE users SET is_banned = FALSE WHERE user_id = $1;", int(text))
-                await conn.close()
-                await update.message.reply_text(f"🟢 تم إلغاء حظر المستخدم `{text}` بنجاح وعاد للوضع النشط.", parse_mode="Markdown")
-            except Exception as e:
-                await update.message.reply_text(f"❌ خطأ إلغاء الحظر: {e}")
+            conn = await asyncpg.connect(fix_database_url(DATABASE_URL))
+            await conn.execute("UPDATE users SET is_banned = FALSE WHERE user_id = $1;", int(text))
+            await conn.close()
+            await update.message.reply_text("🟢 تم إلغاء حظر المستخدم.")
             return
 
     if pdf_state == "WAITING_PASSWORD":
         await files_handler.process_pdf_encryption(update, context, text)
         return
 
-    if not state: return
-
     if state == "WATING_TITLE":
         context.user_data["meta_title"] = text
         context.user_data["audio_state"] = "WATING_ARTIST"
-        await update.message.reply_text("👤 ممتاز، أرسل الآن **اسم الفنان** (أو المغني):", reply_markup=audio_handler.metadata_skip_keyboard())
+        await update.message.reply_text("👤 ممتاز، أرسل الآن **اسم الفنان**:", reply_markup=audio_handler.metadata_skip_keyboard())
     elif state == "WATING_ARTIST":
         context.user_data["meta_artist"] = text
         context.user_data["audio_state"] = "WATING_ART"
-        await update.message.reply_text("🖼️ أرسل الآن **صورة الغلاف** المرجوة (كصورة أو كملف):", reply_markup=audio_handler.metadata_skip_keyboard())
+        await update.message.reply_text("🖼️ أرسل الآن **صورة الغلاف**:", reply_markup=audio_handler.metadata_skip_keyboard())
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await is_user_banned(update.effective_user.id): return
+    if context.user_data.get("audio_state") == "WATING_ART":
+        await audio_handler.handle_photo_as_art(update, context, update.message.photo[-1])
+        return
+    await files_handler.handle_files_photo(update, context)
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
@@ -665,8 +727,7 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
                     path.unlink()
                     removed += 1
             except OSError: pass
-    if removed:
-        logger.info(f"🧹 تم حذف {removed} من الملفات المؤقتة القديمة بنجاح.")
+    if removed: logger.info(f"🧹 تم تنظيف {removed} ملف مؤقت.")
 
 
 # ----------------------------------------------------------------------
@@ -689,13 +750,13 @@ def main():
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, audio_handler.handle_audio_message))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_message_router))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, audio_handler.handle_video_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL, first=CLEANUP_INTERVAL)
 
-    logger.info("🚀 البوت انطلق رسميًا بدعم PostgreSQL ولوحة التحكم المتكاملة الحية...")
+    logger.info("🚀 البوت انطلق رسميًا بكافة ميزات الضغط، القص والـ TTS المضافة...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
 
 
