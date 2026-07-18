@@ -386,18 +386,23 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
 
 
 # ----------------------------------------------------------------------
-# كيبورد اللوحات والقوائم التفاعلية للمستخدمين
+# كيبورد اللوحات والقوائم التفاعلية للمخدمين (تم التعديل بطلبك)
 # ----------------------------------------------------------------------
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
+        # القسم الأول للمستندات والملفات
+        [InlineKeyboardButton("📂 --- قسم أدوات تعديل الملفات ---", callback_data="ignore_section")],
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
-        [InlineKeyboardButton("🎬 فيديو ➜ صوت MP3", callback_data="mode_video2audio")],
-        [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")],
         [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
         [InlineKeyboardButton("🖼️ تحويل صور إلى PDF/Word", callback_data="mode_image")],
         [InlineKeyboardButton("🔒 تشفير حماية الـ PDF", callback_data="mode_encrypt_pdf")],
+        
+        # القسم الثاني للصوتيات والوسائط
+        [InlineKeyboardButton("🎵 --- قسم أدوات تعديل الصوتيات ---", callback_data="ignore_section")],
+        [InlineKeyboardButton("🎬 فيديو ➜ صوت MP3", callback_data="mode_video2audio")],
+        [InlineKeyboardButton("🎵 تحويل صيغة صوتية", callback_data="mode_audio")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -464,6 +469,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🚫 حسابك محظور.", show_alert=True)
         return
 
+    if query.data == "ignore_section":
+        await query.answer("💡 هذا عنوان للقسم فقط، اختر أحد الأزرار بالأسفل.", show_alert=False)
+        return
+
     await query.answer()
     data = query.data
 
@@ -527,7 +536,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await audio_handler.handle_photo_as_art(update, context, update.message.document)
         return
 
-    # التوزيع الديناميكي على موديول الملفات وموديل الصوت حسب الصيغة المستلمة
     is_handled = await files_handler.handle_files_document(update, context)
     if not is_handled:
         await audio_handler.handle_audio_document(update, context)
@@ -655,7 +663,6 @@ def main():
     app.add_handler(CommandHandler("admin", admin_panel_command))
     app.add_handler(CallbackQueryHandler(menu_callback))
     
-    # ربط وتجميع الـ Handlers الفرعية المسجلة داخل موديولات الأقسام الجديدة
     files_handler.register_files_handlers(app)
     audio_handler.register_audio_handlers(app)
     
