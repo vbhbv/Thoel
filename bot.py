@@ -1,68 +1,3 @@
-"""
-بوت تليجرام متقدم لتحويل الصيغ، تعديل الـ Metadata للوسائط، وحماية ملفات PDF.
-مدمج مع قاعدة بيانات PostgreSQL، لوحة تحكم أدمن تفاعلية، ونظام اشتراك إجباري.
-
-هذه نسخة مُعاد هندستها بالكامل من الملف الأصلي الذي أرسلته. أهم الإصلاحات:
-
-🔴 مشاكل أداء حرجة (كانت ستفشل تحت الضغط):
-  1. Connection Pool بدل فتح/إغلاق اتصال PostgreSQL جديد مع كل استدعاء
-     (كل دالة قاعدة بيانات كانت تفتح اتصالاً كاملاً بمفردها - هذا يستنزف
-     حد اتصالات القاعدة بسرعة تحت أي ضغط مستخدمين حقيقي).
-  2. حجب حلقة الأحداث (Event Loop Blocking): `compress_pdf_file_async`
-     و`split_pdf_pages` و`merge_pdf_files` كانت تُنفّذ عمليات pypdf
-     الثقيلة (CPU-bound) مباشرة داخل coroutine async، ما يعني أن ضغط
-     ملف PDF واحد كان يُجمّد البوت بالكامل أمام كل المستخدمين الآخرين
-     في نفس اللحظة (لأن asyncio أحادي الخيط). أُصلحت جميعها بتنفيذها
-     كاملة داخل run_in_executor.
-  3. لا تحديد لحجم الملفات في أي معالج (رغم وجود المتغير MAX_FILE_SIZE_MB
-     معرَّفًا وغير مُفعَّل!). أُضيف فرض هذا الحد فعليًا في كل نقطة استقبال.
-  4. لا حد أقصى لعدد الملفات في عمليات الدمج (PDF/صوت)، ما يسمح بإنهاك
-     الموارد عبر رفع مئات الملفات. أُضيف حد أقصى (20 ملفًا لكل عملية).
-  5. كاش TTL لحالة الحظر وإعداد قناة الاشتراك الإجباري (كانا يُستعلَمان
-     من القاعدة مع كل رسالة تقريبًا من كل مستخدم).
-
-🔒 ثغرات وأخطاء برمجية تم إغلاقها:
-  6. ADMIN_IDS: أُزيل المعرف الافتراضي الوهمي "0"؛ الآن رفض افتراضي كامل
-     إن لم يُضبط المتغير، بدل وهم وجود حماية.
-  7. تحليل ban/unban ID: كان `int(text)` مباشرة بلا try/except، ما يعني
-     أن أي إدخال غير رقمي من الأدمن كان سيتسبب باستثناء غير معالَج
-     (والأدمن يُترك دون أي رد). أُصلح بالتحقق الصريح.
-  8. الإذاعة الجماعية: أُعيدت كتابتها بالكامل - إرسال متزامن محكوم
-     (Semaphore) بدل تسلسل بطيء بـ`except:` عارٍ (كان يلتقط حتى
-     SystemExit/KeyboardInterrupt)، مع تمييز "حظر المستخدم للبوت" وحفظه
-     لتفادي إهدار موارد لاحقًا، ومعالجة صريحة لحد الإرسال (RetryAfter)،
-     وخطوة تأكيد قبل الإرسال الفعلي لتفادي إرسال جماعي بالخطأ.
-  9. Markdown → HTML مع html.escape: استخدام parse_mode="Markdown" القديم
-     مع نصوص تحتوي شرطات سفلية (أسماء ملفات شائعة!) كان يكسر تنسيق
-     الرسالة أو يفشل إرسالها بالكامل. استُبدل بـ HTML مع تهريب أي نص
-     مصدره مستخدم/ملف.
-  10. لا معالج أخطاء عام (Global Error Handler): أي استثناء غير متوقع
-      كان يُترك المستخدم بلا أي رد. أُضيف معالج عام يُخبر المستخدم
-      بحدوث خطأ بدل الصمت التام.
-  11. لا تحقق من صحة نطاق قص PDF (بداية > نهاية، أرقام سالبة) قبل
-      المعالجة، ما قد ينتج ملف PDF فارغًا/تالفًا يُرسَل للمستخدم كأنه
-      نجح. أُضيف تحقق صريح.
-  12. حجم Pool اتصالات HTTPX الافتراضي للبوت كان صغيرًا جدًا لعبء إذاعة
-      جماعية أو استخدام مكثف متزامن؛ زِيد صراحة.
-  13. رسائل الحظر أصبحت متسقة عبر كل المعالجات (بعضها كان صامتًا تمامًا).
-
-⚠️ ملاحظة مهمة وصريحة: هذا الملف يستورد `files_handler` و`audio_handler`
-   واللذان لم يُرسَلا لي، لذا لم أستطع تدقيقهما أو تقويتهما. نقاط الربط
-   معهما (استدعاءات الدوال) بقيت كما هي تمامًا للحفاظ على التوافق. إن
-   أرسلتهما لاحقًا، يمكنني تطبيق نفس مستوى التدقيق عليهما.
-
-📦 المتطلبات (تأكد من وجودها في requirements.txt):
-    asyncpg==0.29.0
-
-🔧 متغيرات بيئة جديدة اختيارية (قيم افتراضية معقولة):
-    DB_POOL_MIN_SIZE=2 | DB_POOL_MAX_SIZE=10 | DB_COMMAND_TIMEOUT=30
-    DB_CONNECT_RETRIES=5 | DB_CONNECT_RETRY_DELAY=3
-    RATE_LIMIT_MAX_REQUESTS=8 | RATE_LIMIT_WINDOW_SECONDS=20
-    BAN_CACHE_TTL_SECONDS=30 | SETTINGS_CACHE_TTL_SECONDS=60
-    BROADCAST_CONCURRENCY=15 | BROADCAST_DELAY_PER_MESSAGE=0.05
-    MAX_MERGE_FILES=20
-"""
-
 import os
 import re
 import html
@@ -1564,6 +1499,32 @@ async def handle_audio_message_router(update: Update, context: ContextTypes.DEFA
     await audio_handler.handle_audio_message(update, context)
 
 
+async def handle_video_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """موجّه مركزي لرسائل الفيديو، يطبّق نفس حمايات handle_audio_message_router
+    (حظر، اشتراك إجباري، Rate Limit، حد الحجم) قبل التفويض لـ audio_handler.
+    هذا الموجّه ضروري لأن استدعاء audio_handler.handle_video_message مباشرة
+    (كما كان سابقًا) كان يتجاوز كل هذه الحمايات المركزية تمامًا."""
+    if await _reject_if_banned(update):
+        return
+
+    user_id = update.effective_user.id
+    missing_channel = await _is_subscription_required_and_unmet(user_id, context)
+    if missing_channel:
+        await update.message.reply_text(
+            "⚠️ لا يمكنك إرسال وسائط! يرجى الاشتراك أولاً.", reply_markup=get_sub_keyboard(missing_channel)
+        )
+        return
+
+    if await _reject_if_rate_limited(update):
+        return
+
+    video = update.message.video or update.message.video_note
+    if not await _check_size_or_reject(update, getattr(video, "file_size", None)):
+        return
+
+    await audio_handler.handle_video_message(update, context)
+
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _reject_if_banned(update):
         return
@@ -1949,15 +1910,26 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CallbackQueryHandler(menu_callback))
 
+    # ⚠️ ترتيب مهم جدًا: يجب تسجيل معالِجات الأزرار ذات الأنماط المحددة
+    # (audiofmt_, vidtarget_extract, meta_skip, وما يعادلها في files_handler)
+    # قبل menu_callback العام الذي يستقبل CallbackQueryHandler بلا أي نمط
+    # (pattern=None) ويطابق تاليًا أي بيانات زر. مكتبة python-telegram-bot
+    # تُجرّب المعالِجات ضمن نفس المجموعة بترتيب التسجيل وتتوقف عند أول
+    # تطابق؛ فلو سُجّل menu_callback أولًا فسيلتهم كل الضغطات (بما فيها
+    # "meta_skip" الخاص بخطوات العنوان/الفنان/الغلاف) قبل أن تصل لمعالِجها
+    # الصحيح في audio_handler.py، مما كان يُبقي حالة "audio_state" عالقة
+    # ولا تتقدم أبدًا إلى "WATING_ART"، فتُعامَل صورة الغلاف كصورة عادية
+    # بدل تطبيقها كغلاف فعلي على الملف الصوتي.
     files_handler.register_files_handlers(app)
     audio_handler.register_audio_handlers(app)
+
+    app.add_handler(CallbackQueryHandler(menu_callback))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio_message_router))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, audio_handler.handle_video_message))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video_message_router))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     app.add_error_handler(global_error_handler)
