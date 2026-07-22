@@ -226,7 +226,7 @@ async def init_db() -> bool:
             )
             break
         except Exception as e:
-            logger.warning(f"⏳ محاولة الاتصال {attempt}/{DB_CONNECT_RETRIES} فشلت...")
+            logger.warning(f"⏳ محاولة الاتصال {attempt}/{DB_CONNECT_RETRIES} فشلت: {e}")
             await asyncio.sleep(DB_CONNECT_RETRY_DELAY)
     else:
         return False
@@ -416,7 +416,6 @@ def apply_audio_metadata(audio_path: Path, title: str = None, artist: str = None
                 audio.delall("APIC")
                 audio.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=image_bytes))
             audio.save(str(audio_path))
-        # الحاويات الأخرى يتم معالجتها عبر الموديولات المناسبة كما في الكود السابق...
     except Exception as e:
         logger.error(f"خطأ في حفظ الميتاداتا: {e}")
 
@@ -578,7 +577,6 @@ async def finalize_and_send_audio(chat_id: int, context: ContextTypes.DEFAULT_TY
 
     await asyncio.get_running_loop().run_in_executor(None, apply_audio_metadata, audio_path, title, artist, art_path)
     with open(audio_path, "rb") as f:
-        # 🟢 إزالة الكومنت/الرسالة الملحقة (caption=None) نهائيًا عند إرسال الموسيقى المحولة
         await context.bot.send_audio(
             chat_id=chat_id,
             audio=f,
@@ -627,7 +625,7 @@ def files_submenu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Word ➜ PDF", callback_data="mode_word2pdf")],
         [InlineKeyboardButton("📄 PDF ➜ Word", callback_data="mode_pdf2word")],
-        [InlineKeyboardButton("✏️ تغيير اسم الملف", callback_data="mode_rename_file")], # 🟢 الميزة الجديدة هنا
+        [InlineKeyboardButton("✏️ تغيير اسم الملف", callback_data="mode_rename_file")],
         [InlineKeyboardButton("✂️ قص صفحات PDF", callback_data="mode_split_pdf")],
         [InlineKeyboardButton("🔗 دمج ملفات PDF", callback_data="mode_merge_pdf")],
         [InlineKeyboardButton("📚 EPUB ➜ PDF", callback_data="mode_ebook")],
@@ -752,7 +750,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["current_mode"] = data
     if data == "mode_word2pdf": await query.edit_message_text("📄 أرسل الآن ملف Word (.doc أو .docx) لتحويله إلى PDF.")
     elif data == "mode_pdf2word": await query.edit_message_text("📄 أرسل الآن ملف PDF لتحويله إلى Word.")
-    elif data == "mode_rename_file": await query.edit_message_text("✏️ أرسل الآن الملف المراد تغيير اسمه (أي صيغة كانت).") # 🟢 استقبال أمر التغيير
+    elif data == "mode_rename_file": await query.edit_message_text("✏️ أرسل الآن الملف المراد تغيير اسمه (أي صيغة كانت).")
     elif data == "mode_video2audio": await query.edit_message_text("🎬 أرسل ملف الفيديو لاستخراج الصوت منه بصيغة MP3.")
     elif data == "mode_ebook": await query.edit_message_text("📚 أرسل ملف EPUB ليتم تحويله تلقائيًا إلى PDF.")
     elif data == "mode_audio": await query.edit_message_text("🎵 أرسل الملف الصوتي المراد تعديله أو تحويل صيغته.")
@@ -810,7 +808,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = doc.file_name or "file"
     mode = context.user_data.get("current_mode")
 
-    # 🟢 معالجة ميزة تغيير اسم الملف المستلم
     if mode == "mode_rename_file":
         lp = await download_telegram_file(context, doc.file_id, doc.file_unique_id, filename)
         context.user_data["rename_source_path"] = str(lp)
@@ -827,7 +824,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with HeavyTaskGuard(): await compress_pdf_file_async(lp, out_p, msg)
             with open(out_p, "rb") as f: await update.message.reply_document(document=f, filename=out_p.name)
         except Exception: await update.message.reply_text("❌ تعذر ضغط هذا الملف.")
-        finally: with contextlib.suppress(Exception): await msg.delete()
+        finally:
+            with contextlib.suppress(Exception):
+                await msg.delete()
         return
 
     if mode == "mode_split_pdf" and filename.lower().endswith(".pdf"):
@@ -860,7 +859,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📥 تم حفظ المقطع رقم ({len(merge_list)}). اكتب <b>دمج</b> عند الانتهاء.", parse_mode=ParseMode.HTML)
             return
 
-    # تفويض لبقية المعالجات الخارجية إن وجدت
     if files_handler:
         is_handled = await files_handler.handle_files_document(update, context)
         if is_handled: return
@@ -897,7 +895,6 @@ async def handle_audio_message_router(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text(f"📥 تم حفظ المقطع رقم ({len(merge_list)}). اكتب <b>دمج</b> للإتمام.", parse_mode=ParseMode.HTML)
         return
 
-    # تفويض للمعالج الخارجي مع إرسال الصوت بدون نص ملحق
     if audio_handler:
         await audio_handler.handle_audio_message(update, context)
 
@@ -917,7 +914,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_state = context.user_data.get("admin_state")
     state = context.user_data.get("audio_state")
     pdf_state = context.user_data.get("pdf_state")
-    file_state = context.user_data.get("file_state") # 🟢 استقبال حالة تعديل الملف
+    file_state = context.user_data.get("file_state")
     text = (update.message.text or "").strip()
 
     # ---------------- معالجة الاسم الجديد للملف ----------------
@@ -933,7 +930,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orig_ext = Path(orig_name).suffix
         new_name = text
         
-        # حماية الصيغة الأصلية للملف إن لم يكتبها المستخدم يدوياً
         if not new_name.lower().endswith(orig_ext.lower()):
             new_name = f"{new_name}{orig_ext}"
             
@@ -942,9 +938,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.copy(str(src_p), str(out_p))
             await log_action("file_rename")
             with open(out_p, "rb") as f:
-                await update.message.reply_document(document=f, filename=new_name, caption=None) # الكابشن ملغي
-        except Exception as e:
-            await update.message.reply_text(f"❌ حدث خطأ أثناء تغيير اسم الملف.")
+                await update.message.reply_document(document=f, filename=new_name, caption=None)
+        except Exception:
+            await update.message.reply_text("❌ حدث خطأ أثناء تغيير اسم الملف.")
+        finally:
+            src_p.unlink(missing_ok=True)
+            out_p.unlink(missing_ok=True)
         return
 
     # ---------------- إعداد الاشتراك الإجباري للآدمن ----------------
@@ -977,6 +976,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(out_p, "rb") as f: await update.message.reply_document(document=f, filename=out_p.name)
             await msg.delete()
         except Exception: await msg.edit_text("❌ فشلت عملية قص صفحات الملف.")
+        finally:
+            src_p.unlink(missing_ok=True)
+            out_p.unlink(missing_ok=True)
         return
 
     # ---------------- دمج ملفات PDF ----------------
@@ -992,6 +994,9 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(out_p, "rb") as f: await update.message.reply_document(document=f, filename="Merged_Document.pdf")
             await msg.delete()
         except Exception: await msg.edit_text("❌ فشل دمج الملفات.")
+        finally:
+            for p in files_list: Path(p).unlink(missing_ok=True)
+            out_p.unlink(missing_ok=True)
         return
 
     # ---------------- دمج ملفات صوتية ----------------
@@ -1005,10 +1010,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with HeavyTaskGuard(): await merge_audio_files([Path(p) for p in audio_list], out_p)
             await log_action("audio_merge")
             with open(out_p, "rb") as f: 
-                # 🟢 إزالة الرسالة الملحقة/caption تماماً عند الإرسال الصوتي
                 await update.message.reply_audio(audio=f, caption=None)
             await msg.delete()
         except Exception: await msg.edit_text("❌ حدث خطأ أثناء الدمج.")
+        finally:
+            for p in audio_list: Path(p).unlink(missing_ok=True)
+            out_p.unlink(missing_ok=True)
         return
 
     # ---------------- تغيير سرعة الصوت ----------------
@@ -1025,10 +1032,12 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await change_audio_speed(src_p, out_p, speed_val)
             await log_action("audio_speed")
             with open(out_p, "rb") as f: 
-                # 🟢 إزالة النص التوضيحي الملحق
                 await update.message.reply_audio(audio=f, caption=None)
             await msg.delete()
         except Exception: await msg.edit_text("❌ حدث خطأ.")
+        finally:
+            src_p.unlink(missing_ok=True)
+            out_p.unlink(missing_ok=True)
         return
 
     # ---------------- تحويل نص إلى صوت (TTS) ----------------
@@ -1037,17 +1046,18 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("audio_state", None)
         if len(text) > 2000: return
         msg = await update.message.reply_text("⏳ جاري توليد المقطع الصوتي...")
+        out_p = CONVERTED_DIR / f"tts_{int(time.time())}.mp3"
         try:
             from gtts import gTTS
-            out_p = CONVERTED_DIR / f"tts_{int(time.time())}.mp3"
             def _tts(): gTTS(text=text, lang="ar").save(str(out_p))
             await asyncio.get_running_loop().run_in_executor(None, _tts)
             await log_action("tts")
             with open(out_p, "rb") as f: 
-                # 🟢 إزالة الكابشن النصي
                 await update.message.reply_audio(audio=f, caption=None)
             await msg.delete()
         except Exception: await msg.edit_text("❌ فشل توليد الصوت.")
+        finally:
+            out_p.unlink(missing_ok=True)
         return
 
 
@@ -1069,10 +1079,14 @@ def main():
 
     loop = asyncio.get_event_loop()
     if not loop.run_until_complete(init_db()):
+        logger.critical("❌ تعذر الاتصال بقاعدة البيانات.")
         return
 
     logger.info("🚀 البوت بدأ العمل بكفاءة عالية الآن...")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        loop.run_until_complete(close_db())
 
 
 if __name__ == "__main__":
