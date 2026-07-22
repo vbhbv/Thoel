@@ -921,29 +921,44 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if file_state == "WAITING_NEW_FILENAME":
         src_path_str = context.user_data.get("rename_source_path")
         orig_name = context.user_data.get("rename_original_name", "file.dat")
+        
         if not src_path_str:
-            await update.message.reply_text("❌ لم يتم العثور على الملف الأصلي، يرجى المحاولة مجدداً.")
+            await update.message.reply_text("❌ انتهت جلسة الملف أو لم يتم العثور عليه. يرجى إرسال الملف من جديد.")
+            context.user_data.pop("file_state", None)
             return
-        context.user_data.pop("file_state", None)
-        
+
         src_p = Path(src_path_str)
+
+        if not src_p.exists():
+            await update.message.reply_text("❌ انتهت صلاحية الملف المؤقت على السيرفر. يرجى إعادة إرساله.")
+            context.user_data.pop("file_state", None)
+            context.user_data.pop("rename_source_path", None)
+            return
+
+        context.user_data.pop("file_state", None)
         orig_ext = Path(orig_name).suffix
-        new_name = text
+        new_name = text.strip()
         
-        if not new_name.lower().endswith(orig_ext.lower()):
+        if orig_ext and not new_name.lower().endswith(orig_ext.lower()):
             new_name = f"{new_name}{orig_ext}"
-            
-        out_p = CONVERTED_DIR / f"renamed_{int(time.time())}_{new_name}"
+
+        target_p = src_p.parent / new_name
+
         try:
-            shutil.copy(str(src_p), str(out_p))
+            src_p.rename(target_p)
             await log_action("file_rename")
-            with open(out_p, "rb") as f:
-                await update.message.reply_document(document=f, filename=new_name, caption=None)
-        except Exception:
-            await update.message.reply_text("❌ حدث خطأ أثناء تغيير اسم الملف.")
+
+            with open(target_p, "rb") as f:
+                await update.message.reply_document(document=f, filename=new_name)
+
+        except Exception as e:
+            logger.error(f"خطأ أثناء تغيير اسم الملف: {e}")
+            await update.message.reply_text("❌ حدث خطأ أثناء معالجة وإرسال الملف.")
         finally:
+            target_p.unlink(missing_ok=True)
             src_p.unlink(missing_ok=True)
-            out_p.unlink(missing_ok=True)
+            context.user_data.pop("rename_source_path", None)
+            context.user_data.pop("rename_original_name", None)
         return
 
     # ---------------- إعداد الاشتراك الإجباري للآدمن ----------------
